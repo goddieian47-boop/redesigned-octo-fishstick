@@ -1,4 +1,543 @@
 name: Build APK
+# Airtime Loader v1.1 - one-file build (adds reading PINs from photos).
+# This workflow writes the whole Android project, compiles it, and uploads app-debug.apk.
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write project files
+        run: |
+          set -e
+          mkdir -p airtime/app/src/main/java/com/example/airtimeloader/
+          cat > airtime/settings.gradle.kts <<'EOF_1'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "AirtimeLoader"
+          include(":app")
+          EOF_1
+          cat > airtime/build.gradle.kts <<'EOF_2'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_2
+          cat > airtime/gradle.properties <<'EOF_3'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2048m
+          kotlin.code.style=official
+          EOF_3
+          cat > airtime/app/build.gradle.kts <<'EOF_4'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.airtimeloader"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.airtimeloader"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 2
+                  versionName = "1.1"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.activity:activity-ktx:1.9.2")
+              // On-device text recognition (model is bundled, no internet needed at runtime)
+              implementation("com.google.mlkit:text-recognition:16.0.1")
+          }
+          EOF_4
+          cat > airtime/app/src/main/AndroidManifest.xml <<'EOF_5'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.CALL_PHONE" />
+              <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+              <uses-permission
+                  android:name="android.permission.READ_EXTERNAL_STORAGE"
+                  android:maxSdkVersion="32" />
+
+              <application
+                  android:label="Airtime Loader"
+                  android:theme="@android:style/Theme.DeviceDefault.Light">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".PinListenerService"
+                      android:exported="true"
+                      android:label="Airtime Loader"
+                      android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.service.notification.NotificationListenerService" />
+                      </intent-filter>
+                  </service>
+
+              </application>
+          </manifest>
+          EOF_5
+          cat > airtime/app/src/main/java/com/example/airtimeloader/MainActivity.kt <<'EOF_6'
+          package com.example.airtimeloader
+
+          import android.Manifest
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import androidx.activity.ComponentActivity
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.core.app.ActivityCompat
+          import com.google.mlkit.vision.common.InputImage
+          import com.google.mlkit.vision.text.TextRecognition
+          import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+
+          class MainActivity : ComponentActivity() {
+
+              private lateinit var resultView: TextView
+              private lateinit var logView: TextView
+
+              private val picker = registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
+                  if (uri != null) testPhoto(uri)
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val pad = (16 * resources.displayMetrics.density).toInt()
+
+                  val column = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(pad, pad * 3, pad, pad)
+                  }
+
+                  fun addButton(label: String, onClick: () -> Unit) {
+                      column.addView(Button(this).apply {
+                          text = label
+                          setOnClickListener { onClick() }
+                      })
+                  }
+
+                  column.addView(TextView(this).apply {
+                      text = "Redeems Safaricom Care giveaway PINs (*141*PIN#) from WhatsApp notifications and photos."
+                  })
+                  addButton("1. Allow notification access") {
+                      startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                  }
+                  addButton("2. Allow phone permission (USSD)") {
+                      ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CALL_PHONE), 1)
+                  }
+                  addButton("3. Allow photo access (choose Allow all)") {
+                      val perm = if (Build.VERSION.SDK_INT >= 33) {
+                          Manifest.permission.READ_MEDIA_IMAGES
+                      } else {
+                          Manifest.permission.READ_EXTERNAL_STORAGE
+                      }
+                      ActivityCompat.requestPermissions(this, arrayOf(perm), 2)
+                  }
+                  addButton("Test: scan a photo (nothing is dialed)") {
+                      picker.launch("image/*")
+                  }
+                  addButton("Reset tried-PIN list and log") {
+                      Store.clear(this)
+                      showLog()
+                  }
+
+                  resultView = TextView(this).apply { setPadding(0, pad, 0, 0) }
+                  column.addView(resultView)
+                  logView = TextView(this).apply { setPadding(0, pad, 0, 0) }
+                  column.addView(logView)
+                  setContentView(ScrollView(this).apply { addView(column) })
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  showLog()
+              }
+
+              private fun showLog() {
+                  logView.text = Store.readLog(this).ifEmpty { "No activity yet." }
+              }
+
+              private fun testPhoto(uri: Uri) {
+                  resultView.text = "Reading photo…"
+                  Thread {
+                      try {
+                          val image = InputImage.fromFilePath(this, uri)
+                          TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS).process(image)
+                              .addOnSuccessListener { result ->
+                                  val pins = result.textBlocks
+                                      .flatMap { it.lines }
+                                      .flatMap { Pins.fromOcrLine(it.text) }
+                                      .distinct()
+                                  resultView.text = if (pins.isEmpty()) {
+                                      "No 16-digit PINs found in that photo."
+                                  } else {
+                                      "Found ${pins.size} PIN(s) (test only, nothing was dialed):\n" +
+                                          pins.joinToString("\n") { Pins.pretty(it) }
+                                  }
+                              }
+                              .addOnFailureListener { e -> resultView.text = "Reading failed: ${e.message}" }
+                      } catch (e: Exception) {
+                          runOnUiThread { resultView.text = "Could not open that photo: ${e.message}" }
+                      }
+                  }.start()
+              }
+          }
+          EOF_6
+          cat > airtime/app/src/main/java/com/example/airtimeloader/PinListenerService.kt <<'EOF_7'
+          package com.example.airtimeloader
+
+          import android.Manifest
+          import android.app.Notification
+          import android.content.ContentUris
+          import android.content.pm.PackageManager
+          import android.database.ContentObserver
+          import android.graphics.Bitmap
+          import android.graphics.drawable.BitmapDrawable
+          import android.graphics.drawable.Icon
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Handler
+          import android.os.Looper
+          import android.provider.MediaStore
+          import android.service.notification.NotificationListenerService
+          import android.service.notification.StatusBarNotification
+          import android.telephony.TelephonyManager
+          import androidx.core.content.ContextCompat
+          import com.google.mlkit.vision.common.InputImage
+          import com.google.mlkit.vision.text.TextRecognition
+          import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+          import java.util.concurrent.Executors
+
+          /**
+           * Reads WhatsApp notifications that mention SOURCE_WORD and redeems any 16-digit airtime PIN
+           * with the Safaricom top-up code *141*PIN#. PINs are found in:
+           *  1. the notification text,
+           *  2. a picture attached to the notification (text recognition on the phone), and
+           *  3. WhatsApp photos that land in the gallery within PHOTO_WINDOW_MS of such a post.
+           * The app has no INTERNET permission, so nothing leaves the phone.
+           */
+          class PinListenerService : NotificationListenerService() {
+
+              private companion object {
+                  // ---- tweak these ----
+                  const val SOURCE_WORD = "safaricom"         // must appear in the notification; "" = any WhatsApp notification
+                  const val MAX_FAILED_PINS = 3               // stop after this many rejected PINs in one run
+                  const val STOP_AFTER_FIRST_SUCCESS = true   // false = keep going and use every valid PIN
+                  const val PHOTO_WINDOW_MS = 90_000L         // how long after a Safaricom post new photos are read
+                  const val MEDIA_BUCKET_WORD = "whatsapp"    // gallery folder name must contain this
+
+                  // Words in Safaricom's reply that mean "PIN rejected". These are guesses:
+                  // check the in-app log and adjust them to the real reply texts.
+                  val REJECTED = Regex(
+                      "invalid|incorrect|not correct|wrong|already|been used|expired|not valid|exceeded|blocked|unable|fail|error|try again",
+                      RegexOption.IGNORE_CASE
+                  )
+
+                  val WHATSAPP = setOf("com.whatsapp", "com.whatsapp.w4b")
+              }
+
+              private val main = Handler(Looper.getMainLooper())
+              private val io = Executors.newSingleThreadExecutor()
+              private val recognizer by lazy { TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS) }
+              private val queue = ArrayDeque<String>()
+              private val seenImages = HashSet<Long>()
+              private var current: String? = null
+              private var failures = 0
+              private var photoWindowUntil = 0L
+
+              private val mediaObserver = object : ContentObserver(main) {
+                  override fun onChange(selfChange: Boolean, uri: Uri?) {
+                      if (System.currentTimeMillis() <= photoWindowUntil) scanRecentImages()
+                  }
+              }
+
+              override fun onListenerConnected() {
+                  contentResolver.unregisterContentObserver(mediaObserver)
+                  contentResolver.registerContentObserver(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, true, mediaObserver)
+              }
+
+              override fun onListenerDisconnected() {
+                  contentResolver.unregisterContentObserver(mediaObserver)
+              }
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  contentResolver.unregisterContentObserver(mediaObserver)
+                  io.shutdown()
+              }
+
+              override fun onNotificationPosted(sbn: StatusBarNotification) {
+                  if (sbn.packageName !in WHATSAPP) return
+                  val extras = sbn.notification.extras
+                  val text = listOfNotNull(
+                      extras.getCharSequence(Notification.EXTRA_TITLE),
+                      extras.getCharSequence(Notification.EXTRA_TEXT),
+                      extras.getCharSequence(Notification.EXTRA_BIG_TEXT),
+                      extras.getCharSequenceArray(Notification.EXTRA_TEXT_LINES)?.joinToString("\n")
+                  ).joinToString("\n")
+                  if (!text.contains(SOURCE_WORD, ignoreCase = true)) return
+
+                  photoWindowUntil = System.currentTimeMillis() + PHOTO_WINDOW_MS
+                  val textPins = Pins.fromText(text)
+                  val picture = notificationPicture(sbn.notification)
+                  Store.log(this, "Safaricom post: ${textPins.size} PIN(s) in text, picture in notification: ${picture != null}")
+                  enqueue(textPins)
+                  if (picture != null) readImage(InputImage.fromBitmap(picture, 0), "Notification")
+              }
+
+              @Suppress("DEPRECATION")
+              private fun notificationPicture(n: Notification): Bitmap? {
+                  val extras = n.extras
+                  extras.getParcelable<Bitmap>(Notification.EXTRA_PICTURE)?.let { return it }
+                  if (Build.VERSION.SDK_INT >= 31) {
+                      val icon = extras.getParcelable<Icon>(Notification.EXTRA_PICTURE_ICON)
+                      val drawable = try { icon?.loadDrawable(this) } catch (e: Exception) { null }
+                      (drawable as? BitmapDrawable)?.bitmap?.let { return it }
+                  }
+                  return null
+              }
+
+              /** Called when a new image appears in the gallery shortly after a Safaricom post. */
+              private fun scanRecentImages() {
+                  val perm = if (Build.VERSION.SDK_INT >= 33) {
+                      Manifest.permission.READ_MEDIA_IMAGES
+                  } else {
+                      Manifest.permission.READ_EXTERNAL_STORAGE
+                  }
+                  if (ContextCompat.checkSelfPermission(this, perm) != PackageManager.PERMISSION_GRANTED) {
+                      Store.log(this, "New photo seen but photo access is not granted (button 3)")
+                      return
+                  }
+
+                  val since = System.currentTimeMillis() / 1000 - 120
+                  val found = ArrayList<Pair<Long, String>>()
+                  try {
+                      contentResolver.query(
+                          MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                          arrayOf(MediaStore.Images.Media._ID, MediaStore.Images.Media.BUCKET_DISPLAY_NAME),
+                          "${MediaStore.Images.Media.DATE_ADDED} >= ?",
+                          arrayOf(since.toString()),
+                          "${MediaStore.Images.Media.DATE_ADDED} DESC"
+                      )?.use { c ->
+                          while (c.moveToNext()) {
+                              found.add(c.getLong(0) to (c.getString(1) ?: ""))
+                          }
+                      }
+                  } catch (e: Exception) {
+                      Store.log(this, "Could not list photos: ${e.javaClass.simpleName}")
+                      return
+                  }
+
+                  for ((id, bucket) in found) {
+                      if (!seenImages.add(id)) continue
+                      if (!bucket.contains(MEDIA_BUCKET_WORD, ignoreCase = true)) {
+                          Store.log(this, "Photo in \"$bucket\" skipped (not a WhatsApp folder)")
+                          continue
+                      }
+                      val uri = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id)
+                      io.execute {
+                          try {
+                              readImage(InputImage.fromFilePath(this, uri), "WhatsApp")
+                          } catch (e: Exception) {
+                              main.post { Store.log(this, "Could not open photo: ${e.javaClass.simpleName}") }
+                          }
+                      }
+                  }
+              }
+
+              private fun readImage(image: InputImage, label: String) {
+                  recognizer.process(image)
+                      .addOnSuccessListener { result ->
+                          val pins = result.textBlocks
+                              .flatMap { it.lines }
+                              .flatMap { Pins.fromOcrLine(it.text) }
+                              .distinct()
+                          Store.log(this, "$label photo: ${pins.size} PIN(s) read")
+                          enqueue(pins)
+                      }
+                      .addOnFailureListener { e ->
+                          Store.log(this, "$label photo: reading failed (${e.javaClass.simpleName})")
+                      }
+              }
+
+              private fun enqueue(pins: List<String>) {
+                  val fresh = pins.distinct()
+                      .filter { !Store.wasTried(this, it) && it != current && it !in queue }
+                  if (fresh.isEmpty()) return
+                  queue.addAll(fresh)
+                  if (current == null) {
+                      failures = 0
+                      redeemNext()
+                  }
+              }
+
+              private fun redeemNext() {
+                  val pin = queue.removeFirstOrNull()
+                  if (pin == null) { current = null; return }
+                  current = pin
+                  val tag = "…" + pin.takeLast(4)   // PINs are masked in the log
+
+                  val allowed = ContextCompat.checkSelfPermission(this, Manifest.permission.CALL_PHONE) ==
+                      PackageManager.PERMISSION_GRANTED
+                  if (!allowed) {
+                      Store.log(this, "$tag skipped: phone permission not granted")
+                      endRun(); return
+                  }
+                  val tm = getSystemService(TelephonyManager::class.java)
+                  if (tm == null) { endRun(); return }
+
+                  try {
+                      tm.sendUssdRequest("*141*$pin#", object : TelephonyManager.UssdResponseCallback() {
+                          override fun onReceiveUssdResponse(t: TelephonyManager, request: String, response: CharSequence) {
+                              Store.markTried(this@PinListenerService, pin)
+                              Store.log(this@PinListenerService, "$tag: " + response.toString().replace('\n', ' ').take(110))
+                              val rejected = REJECTED.containsMatchIn(response)
+                              if (rejected) failures++
+                              val done = (!rejected && STOP_AFTER_FIRST_SUCCESS) || failures >= MAX_FAILED_PINS
+                              if (done) endRun() else redeemNext()
+                          }
+
+                          override fun onReceiveUssdResponseFailed(t: TelephonyManager, request: String, failureCode: Int) {
+                              Store.log(this@PinListenerService, "$tag: USSD error $failureCode")
+                              endRun()
+                          }
+                      }, main)
+                  } catch (e: Exception) {
+                      Store.log(this, "$tag: ${e.javaClass.simpleName}")
+                      endRun()
+                  }
+              }
+
+              private fun endRun() {
+                  queue.clear()
+                  current = null
+              }
+          }
+          EOF_7
+          cat > airtime/app/src/main/java/com/example/airtimeloader/Store.kt <<'EOF_8'
+          package com.example.airtimeloader
+
+          import android.content.Context
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+
+          /** Remembers which PINs were already tried and keeps a short on-screen log. */
+          object Store {
+              private fun prefs(ctx: Context) =
+                  ctx.getSharedPreferences("airtime_loader", Context.MODE_PRIVATE)
+
+              fun wasTried(ctx: Context, pin: String): Boolean =
+                  prefs(ctx).getStringSet("tried", emptySet())!!.contains(pin)
+
+              fun markTried(ctx: Context, pin: String) {
+                  val tried = prefs(ctx).getStringSet("tried", emptySet())!!.toMutableSet()
+                  tried.add(pin)
+                  prefs(ctx).edit().putStringSet("tried", tried).apply()
+              }
+
+              fun log(ctx: Context, line: String) {
+                  val stamp = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
+                  val old = prefs(ctx).getString("log", "").orEmpty().lines()
+                  val lines = (listOf("$stamp  $line") + old).filter { it.isNotBlank() }.take(30)
+                  prefs(ctx).edit().putString("log", lines.joinToString("\n")).apply()
+              }
+
+              fun readLog(ctx: Context): String = prefs(ctx).getString("log", "").orEmpty()
+
+              fun clear(ctx: Context) {
+                  prefs(ctx).edit().clear().apply()
+              }
+          }
+          EOF_8
+          cat > airtime/app/src/main/java/com/example/airtimeloader/Pins.kt <<'EOF_9'
+          package com.example.airtimeloader
+
+          /** Finds 16-digit airtime PINs in plain text or in OCR output. */
+          object Pins {
+              private val PIN = Regex("""(?<!\d)(\d{4})[ \u00A0-]?(\d{4})[ \u00A0-]?(\d{4})[ \u00A0-]?(\d{4})(?!\d)""")
+
+              fun fromText(text: String): List<String> =
+                  PIN.findAll(text).map { m -> m.groupValues.drop(1).joinToString("") }.distinct().toList()
+
+              /** OCR often confuses O/0 and I/l/1, so fix those on lines that are mostly digits. */
+              fun fromOcrLine(line: String): List<String> {
+                  if (line.count { it.isDigit() } < 12) return emptyList()
+                  val fixed = line.map { c ->
+                      when (c) {
+                          'O', 'o' -> '0'
+                          'I', 'l', '|' -> '1'
+                          else -> c
+                      }
+                  }.joinToString("")
+                  return fromText(fixed)
+              }
+
+              fun pretty(pin: String): String = pin.chunked(4).joinToString(" ")
+          }
+          EOF_9
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Accept Android SDK licenses
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Build debug APK
+        working-directory: airtime
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: airtime-loader-apk
+          path: airtime/app/build/outputs/apk/debug/app-debug.apk
 
 on:
   push:
