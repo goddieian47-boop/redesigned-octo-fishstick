@@ -1,0 +1,339 @@
+# Airtime Loader - one-file build.
+# This workflow writes the whole Android project, compiles it, and uploads app-debug.apk.
+# Put this file at .github/workflows/build.yml in a GitHub repo, then open the Actions tab.
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write project files
+        run: |
+          set -e
+          mkdir -p airtime/app/src/main/java/com/example/airtimeloader/
+          mkdir -p airtime/app/src/main
+          cat > airtime/settings.gradle.kts <<'EOF_1'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "AirtimeLoader"
+          include(":app")
+          EOF_1
+          cat > airtime/build.gradle.kts <<'EOF_2'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_2
+          cat > airtime/gradle.properties <<'EOF_3'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2048m
+          kotlin.code.style=official
+          EOF_3
+          cat > airtime/app/build.gradle.kts <<'EOF_4'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.airtimeloader"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.airtimeloader"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.activity:activity-ktx:1.9.2")
+          }
+          EOF_4
+          cat > airtime/app/src/main/AndroidManifest.xml <<'EOF_5'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.CALL_PHONE" />
+
+              <application
+                  android:label="Airtime Loader"
+                  android:theme="@android:style/Theme.DeviceDefault.Light">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".PinListenerService"
+                      android:exported="true"
+                      android:label="Airtime Loader"
+                      android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.service.notification.NotificationListenerService" />
+                      </intent-filter>
+                  </service>
+
+              </application>
+          </manifest>
+          EOF_5
+          cat > airtime/app/src/main/java/com/example/airtimeloader/MainActivity.kt <<'EOF_6'
+          package com.example.airtimeloader
+
+          import android.Manifest
+          import android.content.Intent
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import androidx.activity.ComponentActivity
+          import androidx.core.app.ActivityCompat
+
+          class MainActivity : ComponentActivity() {
+
+              private lateinit var logView: TextView
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val pad = (16 * resources.displayMetrics.density).toInt()
+
+                  val column = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(pad, pad * 3, pad, pad)
+                  }
+
+                  fun addButton(label: String, onClick: () -> Unit) {
+                      column.addView(Button(this).apply {
+                          text = label
+                          setOnClickListener { onClick() }
+                      })
+                  }
+
+                  column.addView(TextView(this).apply {
+                      text = "Redeems Safaricom Care giveaway PINs (*141*PIN#) when they arrive as WhatsApp notifications."
+                  })
+                  addButton("1. Allow notification access") {
+                      startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                  }
+                  addButton("2. Allow phone permission (USSD)") {
+                      ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CALL_PHONE), 1)
+                  }
+                  addButton("Reset tried-PIN list and log") {
+                      Store.clear(this)
+                      showLog()
+                  }
+
+                  logView = TextView(this).apply { setPadding(0, pad, 0, 0) }
+                  column.addView(logView)
+                  setContentView(ScrollView(this).apply { addView(column) })
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  showLog()
+              }
+
+              private fun showLog() {
+                  logView.text = Store.readLog(this).ifEmpty { "No activity yet." }
+              }
+          }
+          EOF_6
+          cat > airtime/app/src/main/java/com/example/airtimeloader/PinListenerService.kt <<'EOF_7'
+          package com.example.airtimeloader
+
+          import android.Manifest
+          import android.app.Notification
+          import android.content.pm.PackageManager
+          import android.os.Handler
+          import android.os.Looper
+          import android.service.notification.NotificationListenerService
+          import android.service.notification.StatusBarNotification
+          import android.telephony.TelephonyManager
+          import androidx.core.content.ContextCompat
+
+          /**
+           * Reads WhatsApp notifications that mention SOURCE_WORD, picks out 16-digit airtime PINs
+           * and redeems them with the Safaricom top-up code *141*PIN#.
+           * The app has no INTERNET permission, so nothing leaves the phone.
+           */
+          class PinListenerService : NotificationListenerService() {
+
+              private companion object {
+                  // ---- tweak these ----
+                  const val SOURCE_WORD = "safaricom"         // must appear in the notification; "" = any WhatsApp notification
+                  const val MAX_FAILED_PINS = 3               // stop after this many rejected PINs in one run
+                  const val STOP_AFTER_FIRST_SUCCESS = true   // false = keep going and use every valid PIN
+
+                  // Words in Safaricom's reply that mean "PIN rejected". These are guesses:
+                  // check the in-app log and adjust them to the real reply texts.
+                  val REJECTED = Regex(
+                      "invalid|incorrect|not correct|wrong|already|been used|expired|not valid|exceeded|blocked|unable|fail|error|try again",
+                      RegexOption.IGNORE_CASE
+                  )
+
+                  val WHATSAPP = setOf("com.whatsapp", "com.whatsapp.w4b")
+                  val PIN = Regex("""(?<!\d)(\d{4})[ \u00A0-]?(\d{4})[ \u00A0-]?(\d{4})[ \u00A0-]?(\d{4})(?!\d)""")
+              }
+
+              private val main = Handler(Looper.getMainLooper())
+              private val queue = ArrayDeque<String>()
+              private var current: String? = null
+              private var failures = 0
+
+              override fun onNotificationPosted(sbn: StatusBarNotification) {
+                  if (sbn.packageName !in WHATSAPP) return
+                  val extras = sbn.notification.extras
+                  val text = listOfNotNull(
+                      extras.getCharSequence(Notification.EXTRA_TITLE),
+                      extras.getCharSequence(Notification.EXTRA_TEXT),
+                      extras.getCharSequence(Notification.EXTRA_BIG_TEXT),
+                      extras.getCharSequenceArray(Notification.EXTRA_TEXT_LINES)?.joinToString("\n")
+                  ).joinToString("\n")
+                  if (!text.contains(SOURCE_WORD, ignoreCase = true)) return
+
+                  val fresh = PIN.findAll(text)
+                      .map { m -> m.groupValues.drop(1).joinToString("") }
+                      .distinct()
+                      .filter { !Store.wasTried(this, it) && it != current && it !in queue }
+                      .toList()
+                  if (fresh.isEmpty()) return
+
+                  queue.addAll(fresh)
+                  if (current == null) {
+                      failures = 0
+                      redeemNext()
+                  }
+              }
+
+              private fun redeemNext() {
+                  val pin = queue.removeFirstOrNull()
+                  if (pin == null) { current = null; return }
+                  current = pin
+                  val tag = "…" + pin.takeLast(4)   // PINs are masked in the log
+
+                  val allowed = ContextCompat.checkSelfPermission(this, Manifest.permission.CALL_PHONE) ==
+                      PackageManager.PERMISSION_GRANTED
+                  if (!allowed) {
+                      Store.log(this, "$tag skipped: phone permission not granted")
+                      endRun(); return
+                  }
+                  val tm = getSystemService(TelephonyManager::class.java)
+                  if (tm == null) { endRun(); return }
+
+                  try {
+                      tm.sendUssdRequest("*141*$pin#", object : TelephonyManager.UssdResponseCallback() {
+                          override fun onReceiveUssdResponse(t: TelephonyManager, request: String, response: CharSequence) {
+                              Store.markTried(this@PinListenerService, pin)
+                              Store.log(this@PinListenerService, "$tag: " + response.toString().replace('\n', ' ').take(110))
+                              val rejected = REJECTED.containsMatchIn(response)
+                              if (rejected) failures++
+                              val done = (!rejected && STOP_AFTER_FIRST_SUCCESS) || failures >= MAX_FAILED_PINS
+                              if (done) endRun() else redeemNext()
+                          }
+
+                          override fun onReceiveUssdResponseFailed(t: TelephonyManager, request: String, failureCode: Int) {
+                              Store.log(this@PinListenerService, "$tag: USSD error $failureCode")
+                              endRun()
+                          }
+                      }, main)
+                  } catch (e: Exception) {
+                      Store.log(this, "$tag: ${e.javaClass.simpleName}")
+                      endRun()
+                  }
+              }
+
+              private fun endRun() {
+                  queue.clear()
+                  current = null
+              }
+          }
+          EOF_7
+          cat > airtime/app/src/main/java/com/example/airtimeloader/Store.kt <<'EOF_8'
+          package com.example.airtimeloader
+
+          import android.content.Context
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+
+          /** Remembers which PINs were already tried and keeps a short on-screen log. */
+          object Store {
+              private fun prefs(ctx: Context) =
+                  ctx.getSharedPreferences("airtime_loader", Context.MODE_PRIVATE)
+
+              fun wasTried(ctx: Context, pin: String): Boolean =
+                  prefs(ctx).getStringSet("tried", emptySet())!!.contains(pin)
+
+              fun markTried(ctx: Context, pin: String) {
+                  val tried = prefs(ctx).getStringSet("tried", emptySet())!!.toMutableSet()
+                  tried.add(pin)
+                  prefs(ctx).edit().putStringSet("tried", tried).apply()
+              }
+
+              fun log(ctx: Context, line: String) {
+                  val stamp = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
+                  val old = prefs(ctx).getString("log", "").orEmpty().lines()
+                  val lines = (listOf("$stamp  $line") + old).filter { it.isNotBlank() }.take(30)
+                  prefs(ctx).edit().putString("log", lines.joinToString("\n")).apply()
+              }
+
+              fun readLog(ctx: Context): String = prefs(ctx).getString("log", "").orEmpty()
+
+              fun clear(ctx: Context) {
+                  prefs(ctx).edit().clear().apply()
+              }
+          }
+          EOF_8
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Accept Android SDK licenses
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Build debug APK
+        working-directory: airtime
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: airtime-loader-apk
+          path: airtime/app/build/outputs/apk/debug/app-debug.apk
