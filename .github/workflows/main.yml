@@ -1,0 +1,3116 @@
+# Airtime Loader v2.0 - one-file build.
+# Adds: airtime balance, clock, themes and wallpapers, scratch-card and QR/barcode scanner,
+# Wi-Fi speed test and network scan, Bluetooth file sharing, phone dialer and texting.
+# This workflow writes the whole Android project, compiles it, and uploads app-debug.apk.
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write project files
+        run: |
+          set -e
+          mkdir -p airtime
+          mkdir -p airtime/app
+          mkdir -p airtime/app/src/main
+          mkdir -p airtime/app/src/main/java/com/example/airtimeloader
+          mkdir -p airtime/app/src/main/res/drawable
+          mkdir -p airtime/app/src/main/res/mipmap-anydpi-v26
+          mkdir -p airtime/app/src/main/res/values
+          mkdir -p airtime/app/src/main/res/xml
+          cat > airtime/app/build.gradle.kts <<'EOF_1'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.airtimeloader"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.airtimeloader"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 7
+                  versionName = "2.0"
+                  ndk {
+                      abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+              buildFeatures {
+                  compose = true
+              }
+              composeOptions {
+                  kotlinCompilerExtensionVersion = "1.5.14"
+              }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.activity:activity-compose:1.9.2")
+              implementation(platform("androidx.compose:compose-bom:2024.06.00"))
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.foundation:foundation")
+              implementation("androidx.compose.material3:material3")
+              // On-device text recognition (model is bundled, no internet needed at runtime)
+              implementation("com.google.mlkit:text-recognition:16.0.1")
+              implementation("com.google.mlkit:barcode-scanning:17.3.0")
+              // Camera for the scratch-card and QR scanner
+              implementation("androidx.camera:camera-core:1.3.4")
+              implementation("androidx.camera:camera-camera2:1.3.4")
+              implementation("androidx.camera:camera-lifecycle:1.3.4")
+              implementation("androidx.camera:camera-view:1.3.4")
+          }
+          EOF_1
+          cat > airtime/app/src/main/AndroidManifest.xml <<'EOF_2'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.CALL_PHONE" />
+              <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+              <uses-permission
+                  android:name="android.permission.READ_EXTERNAL_STORAGE"
+                  android:maxSdkVersion="32" />
+              <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.VIBRATE" />
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+              <uses-permission android:name="android.permission.CAMERA" />
+              <uses-permission android:name="android.permission.SEND_SMS" />
+              <uses-feature android:name="android.hardware.telephony" android:required="false" />
+              <uses-feature android:name="android.hardware.camera" android:required="false" />
+
+              <queries>
+                  <package android:name="com.android.bluetooth" />
+                  <package android:name="com.google.android.bluetooth" />
+              </queries>
+
+              <application
+                  android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher_round"
+                  android:label="Airtime Loader"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <activity
+                      android:name=".ScannerActivity"
+                      android:exported="false"
+                      android:theme="@android:style/Theme.DeviceDefault.NoActionBar" />
+
+                  <service
+                      android:name=".PinListenerService"
+                      android:exported="true"
+                      android:label="Airtime Loader"
+                      android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.service.notification.NotificationListenerService" />
+                      </intent-filter>
+                  </service>
+
+                  <service
+                      android:name=".ScreenReaderService"
+                      android:exported="true"
+                      android:label="Airtime Loader screen reader"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+
+              </application>
+          </manifest>
+          EOF_2
+          cat > airtime/app/src/main/java/com/example/airtimeloader/Alerts.kt <<'EOF_3'
+          package com.example.airtimeloader
+
+          import android.Manifest
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.os.Build
+          import androidx.core.app.NotificationCompat
+          import androidx.core.app.NotificationManagerCompat
+          import androidx.core.content.ContextCompat
+
+          /** Status notifications: PIN found (quiet) and the final result (heads-up). */
+          object Alerts {
+              private const val PROGRESS_CHANNEL = "progress"
+              private const val RESULT_CHANNEL = "results"
+              private const val ID = 1001
+
+              /** Quiet update, e.g. "PIN found, redeeming". */
+              fun progress(ctx: Context, title: String, text: String) = post(ctx, title, text, loud = false)
+
+              /** Final outcome, shown as a heads-up alert. */
+              fun finish(ctx: Context, title: String, text: String) = post(ctx, title, text, loud = true)
+
+              private fun post(ctx: Context, title: String, text: String, loud: Boolean) {
+                  val app = ctx.applicationContext
+                  try {
+                      if (Build.VERSION.SDK_INT >= 33 &&
+                          ContextCompat.checkSelfPermission(app, Manifest.permission.POST_NOTIFICATIONS) !=
+                          PackageManager.PERMISSION_GRANTED
+                      ) return
+                      val compat = NotificationManagerCompat.from(app)
+                      if (!compat.areNotificationsEnabled()) return
+
+                      val manager = app.getSystemService(NotificationManager::class.java) ?: return
+                      manager.createNotificationChannel(
+                          NotificationChannel(PROGRESS_CHANNEL, "Voucher progress", NotificationManager.IMPORTANCE_LOW)
+                      )
+                      manager.createNotificationChannel(
+                          NotificationChannel(RESULT_CHANNEL, "Voucher results", NotificationManager.IMPORTANCE_HIGH)
+                      )
+
+                      val open = PendingIntent.getActivity(
+                          app,
+                          0,
+                          Intent(app, MainActivity::class.java)
+                              .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP),
+                          PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                      )
+                      val builder = NotificationCompat.Builder(app, if (loud) RESULT_CHANNEL else PROGRESS_CHANNEL)
+                          .setSmallIcon(R.drawable.ic_stat_airtime)
+                          .setColor(0xFF10B981.toInt())
+                          .setContentTitle(title)
+                          .setContentText(text)
+                          .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+                          .setContentIntent(open)
+                          .setAutoCancel(true)
+                          .setCategory(NotificationCompat.CATEGORY_STATUS)
+                          .setPriority(if (loud) NotificationCompat.PRIORITY_HIGH else NotificationCompat.PRIORITY_LOW)
+                      if (!loud) builder.setTimeoutAfter(60_000L)
+                      compat.notify(ID, builder.build())
+                  } catch (e: SecurityException) {
+                      // notifications not allowed; nothing to do
+                  }
+              }
+          }
+          EOF_3
+          cat > airtime/app/src/main/java/com/example/airtimeloader/Balance.kt <<'EOF_4'
+          package com.example.airtimeloader
+
+          import android.content.Context
+
+          /** Checks the airtime balance with Safaricom's *144# and remembers the last answer. */
+          object Balance {
+              private const val CODE = "*144#"
+              private val AMOUNT = Regex("""(?i)(?:ksh|kes)\.?\s*([0-9][0-9,]*(?:\.[0-9]+)?)""")
+
+              @Volatile
+              var busy = false
+                  private set
+
+              class Snapshot(val amount: String?, val reply: String, val time: Long)
+
+              private fun prefs(ctx: Context) = ctx.getSharedPreferences("balance", Context.MODE_PRIVATE)
+
+              fun last(ctx: Context): Snapshot? {
+                  val p = prefs(ctx)
+                  val t = p.getLong("time", 0L)
+                  if (t == 0L) return null
+                  return Snapshot(p.getString("amount", null), p.getString("reply", "").orEmpty(), t)
+              }
+
+              /** [onDone] gets an error message, or null on success. */
+              fun refresh(ctx: Context, onDone: ((String?) -> Unit)? = null) {
+                  if (busy) return
+                  busy = true
+                  val app = ctx.applicationContext
+                  Ussd.send(
+                      app,
+                      CODE,
+                      onReply = { raw ->
+                          busy = false
+                          val reply = raw.replace('\n', ' ').trim()
+                          val amount = AMOUNT.find(reply)?.groupValues?.get(1)
+                          prefs(app).edit()
+                              .putString("amount", amount)
+                              .putString("reply", reply.take(200))
+                              .putLong("time", System.currentTimeMillis())
+                              .apply()
+                          Store.log(app, "Balance: " + (if (amount != null) "Ksh $amount" else reply.take(80)))
+                          onDone?.invoke(null)
+                      },
+                      onError = { msg ->
+                          busy = false
+                          Store.log(app, "Balance check failed: $msg")
+                          onDone?.invoke(msg)
+                      }
+                  )
+              }
+          }
+          EOF_4
+          cat > airtime/app/src/main/java/com/example/airtimeloader/DialTab.kt <<'EOF_5'
+          package com.example.airtimeloader
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Context
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Build
+          import android.provider.ContactsContract
+          import android.telephony.SmsManager
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.shape.CircleShape
+          import androidx.compose.foundation.text.KeyboardOptions
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.input.KeyboardType
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+
+          private fun placeCall(ctx: Context, number: String) {
+              if (number.isBlank()) return
+              val uri = Uri.fromParts("tel", number, null)
+              try {
+                  if (granted(ctx, Manifest.permission.CALL_PHONE)) {
+                      ctx.startActivity(Intent(Intent.ACTION_CALL, uri))
+                  } else {
+                      ctx.startActivity(Intent(Intent.ACTION_DIAL, uri))
+                  }
+              } catch (e: Exception) {
+                  // no phone app
+              }
+          }
+
+          /** Sends a text through the phone's SIM. Returns an error message, or null when it was handed to the network. */
+          @Suppress("DEPRECATION")
+          private fun sendSms(ctx: Context, number: String, text: String): String? {
+              return try {
+                  val sms: SmsManager? =
+                      if (Build.VERSION.SDK_INT >= 31) ctx.getSystemService(SmsManager::class.java) else SmsManager.getDefault()
+                  if (sms == null) {
+                      "This phone cannot send text messages."
+                  } else {
+                      sms.sendMultipartTextMessage(number, null, sms.divideMessage(text), null, null)
+                      null
+                  }
+              } catch (e: Exception) {
+                  e.message ?: e.javaClass.simpleName
+              }
+          }
+
+          private fun openMessagesApp(ctx: Context, number: String, text: String) {
+              try {
+                  ctx.startActivity(
+                      Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:" + Uri.encode(number))).putExtra("sms_body", text)
+                  )
+              } catch (e: Exception) {
+                  // no messaging app
+              }
+          }
+
+          /** Reads the number of a contact picked in the system contacts screen (no contacts permission needed). */
+          private fun phoneFrom(ctx: Context, uri: Uri): String? =
+              ctx.contentResolver
+                  .query(uri, arrayOf(ContactsContract.CommonDataKinds.Phone.NUMBER), null, null, null)
+                  ?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
+                  ?.filter { it.isDigit() || it == '+' || it == '*' || it == '#' }
+
+          @Composable
+          private fun Key(label: String, onClick: () -> Unit) {
+              val p = LocalPalette.current
+              Box(
+                  Modifier
+                      .size(72.dp)
+                      .clip(CircleShape)
+                      .background(p.textLo.copy(alpha = 0.18f))
+                      .clickable { onClick() },
+                  contentAlignment = Alignment.Center
+              ) {
+                  Text(label, color = p.textHi, fontSize = 26.sp, fontWeight = FontWeight.Medium)
+              }
+          }
+
+          @Composable
+          fun DialTab() {
+              val ctx = LocalContext.current
+              val p = LocalPalette.current
+              var number by remember { mutableStateOf("") }
+              var message by remember { mutableStateOf("") }
+              var status by remember { mutableStateOf("") }
+
+              val callLauncher =
+                  rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
+                      if (ok) placeCall(ctx, number) else status = "Allow the Phone permission to call from here."
+                  }
+              val smsLauncher =
+                  rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
+                      status = if (ok) "SMS allowed. Tap Send again." else "Allow the SMS permission to send texts from here."
+                  }
+              val contactLauncher =
+                  rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { res ->
+                      val uri = res.data?.data
+                      if (res.resultCode == Activity.RESULT_OK && uri != null) {
+                          val picked = phoneFrom(ctx, uri)
+                          if (picked != null) number = picked
+                      }
+                  }
+
+              TabColumn {
+                  Header("Dial", "Call and text from here")
+
+                  Panel {
+                      Text(
+                          if (number.isEmpty()) "Enter a number" else number,
+                          color = if (number.isEmpty()) p.textLo else p.textHi,
+                          fontSize = 30.sp,
+                          fontWeight = FontWeight.Bold,
+                          maxLines = 1,
+                          modifier = Modifier.fillMaxWidth()
+                      )
+                      val rows = listOf(
+                          listOf("1", "2", "3"),
+                          listOf("4", "5", "6"),
+                          listOf("7", "8", "9"),
+                          listOf("*", "0", "#")
+                      )
+                      rows.forEach { row ->
+                          Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+                              row.forEach { k -> Key(k) { number += k } }
+                          }
+                      }
+                      Row(
+                          Modifier.fillMaxWidth(),
+                          horizontalArrangement = Arrangement.SpaceEvenly,
+                          verticalAlignment = Alignment.CenterVertically
+                      ) {
+                          GhostButton("Contacts") {
+                              try {
+                                  contactLauncher.launch(
+                                      Intent(Intent.ACTION_PICK, ContactsContract.CommonDataKinds.Phone.CONTENT_URI)
+                                  )
+                              } catch (e: Exception) {
+                                  status = "No contacts app found."
+                              }
+                          }
+                          AccentButton("Call", enabled = number.isNotEmpty()) {
+                              if (granted(ctx, Manifest.permission.CALL_PHONE)) {
+                                  placeCall(ctx, number)
+                              } else {
+                                  callLauncher.launch(Manifest.permission.CALL_PHONE)
+                              }
+                          }
+                          GhostButton("⌫") { number = number.dropLast(1) }
+                      }
+                      if (number.isNotEmpty()) {
+                          TextButton(onClick = { number = "" }) { Text("Clear", color = p.textLo) }
+                      }
+                  }
+
+                  Panel {
+                      Title("Text message")
+                      OutlinedTextField(
+                          value = number,
+                          onValueChange = { v -> number = v.filter { it.isDigit() || it == '+' || it == '*' || it == '#' } },
+                          label = { Text("To") },
+                          singleLine = true,
+                          keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
+                          modifier = Modifier.fillMaxWidth()
+                      )
+                      OutlinedTextField(
+                          value = message,
+                          onValueChange = { message = it },
+                          label = { Text("Message") },
+                          minLines = 3,
+                          modifier = Modifier.fillMaxWidth()
+                      )
+                      Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                          AccentButton("Send", enabled = number.isNotEmpty() && message.isNotBlank()) {
+                              if (!granted(ctx, Manifest.permission.SEND_SMS)) {
+                                  smsLauncher.launch(Manifest.permission.SEND_SMS)
+                              } else {
+                                  val err = sendSms(ctx, number, message)
+                                  status = if (err == null) {
+                                      "Message handed to the network for $number. Standard SMS charges apply."
+                                  } else {
+                                      "Could not send: $err"
+                                  }
+                                  if (err == null) message = ""
+                              }
+                          }
+                          GhostButton("Open Messages") { openMessagesApp(ctx, number, message) }
+                      }
+                      Body("This sends texts; it does not show your inbox. Use your Messages app to read replies.")
+                      if (status.isNotEmpty()) Body(status)
+                  }
+              }
+          }
+          EOF_5
+          cat > airtime/app/src/main/java/com/example/airtimeloader/Look.kt <<'EOF_6'
+          package com.example.airtimeloader
+
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import android.net.Uri
+          import android.os.Handler
+          import android.os.Looper
+          import androidx.compose.ui.graphics.ImageBitmap
+          import androidx.compose.ui.graphics.asImageBitmap
+          import java.io.File
+
+          /** Remembers the chosen theme and wallpaper. A photo wallpaper is stored as a small file inside the app. */
+          object Look {
+              private fun prefs(ctx: Context) = ctx.getSharedPreferences("look", Context.MODE_PRIVATE)
+              private fun file(ctx: Context) = File(ctx.filesDir, "wallpaper.jpg")
+
+              fun theme(ctx: Context): Int = prefs(ctx).getInt("theme", 0).coerceIn(0, PALETTES.size - 1)
+
+              fun setTheme(ctx: Context, index: Int) {
+                  prefs(ctx).edit().putInt("theme", index).apply()
+              }
+
+              fun wallpaper(ctx: Context): Int = prefs(ctx).getInt("wallpaper", 0)
+
+              fun setWallpaper(ctx: Context, index: Int) {
+                  prefs(ctx).edit().putInt("wallpaper", index).apply()
+              }
+
+              fun version(ctx: Context): Int = prefs(ctx).getInt("wp_version", 0)
+
+              fun hasCustom(ctx: Context): Boolean = file(ctx).exists()
+
+              fun loadCustom(ctx: Context): ImageBitmap? =
+                  try {
+                      BitmapFactory.decodeFile(file(ctx).path)?.asImageBitmap()
+                  } catch (e: Exception) {
+                      null
+                  }
+
+              /** Shrinks the picked photo, stores it, and calls [onDone] on the main thread. */
+              fun saveCustom(ctx: Context, uri: Uri, onDone: (Boolean) -> Unit) {
+                  val app = ctx.applicationContext
+                  Thread {
+                      val ok = try {
+                          val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                          app.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+                          var sample = 1
+                          while (maxOf(bounds.outWidth, bounds.outHeight) / sample > 1600) sample *= 2
+                          val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+                          val bmp = app.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts) }
+                          if (bmp == null) {
+                              false
+                          } else {
+                              file(app).outputStream().use { bmp.compress(Bitmap.CompressFormat.JPEG, 85, it) }
+                              prefs(app).edit()
+                                  .putInt("wp_version", version(app) + 1)
+                                  .putInt("wallpaper", CUSTOM_WALL)
+                                  .apply()
+                              true
+                          }
+                      } catch (e: Exception) {
+                          false
+                      }
+                      Handler(Looper.getMainLooper()).post { onDone(ok) }
+                  }.start()
+              }
+          }
+          EOF_6
+          cat > airtime/app/src/main/java/com/example/airtimeloader/LookTab.kt <<'EOF_7'
+          package com.example.airtimeloader
+
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.border
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.horizontalScroll
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.shape.CircleShape
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.graphics.Brush
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+
+          @Composable
+          fun LookTab(
+              themeIdx: Int,
+              wallIdx: Int,
+              hasCustom: Boolean,
+              onTheme: (Int) -> Unit,
+              onWall: (Int) -> Unit,
+              onCustomSaved: () -> Unit
+          ) {
+              val ctx = LocalContext.current
+              val p = LocalPalette.current
+              var message by remember { mutableStateOf("") }
+              val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+                  if (uri != null) {
+                      message = "Saving wallpaper…"
+                      Look.saveCustom(ctx, uri) { ok ->
+                          message = if (ok) "Wallpaper set." else "Could not use that photo."
+                          if (ok) onCustomSaved()
+                      }
+                  }
+              }
+
+              TabColumn {
+                  Header("Look", "Colours and wallpapers")
+
+                  Panel {
+                      Title("Theme")
+                      Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                          PALETTES.forEachIndexed { i, pal ->
+                              Column(
+                                  horizontalAlignment = Alignment.CenterHorizontally,
+                                  modifier = Modifier.clickable { onTheme(i) }
+                              ) {
+                                  Box(
+                                      Modifier
+                                          .size(52.dp)
+                                          .clip(CircleShape)
+                                          .background(Brush.linearGradient(listOf(pal.heroA, pal.accent)))
+                                          .border(if (i == themeIdx) 3.dp else 0.dp, p.textHi, CircleShape)
+                                  )
+                                  Text(
+                                      pal.name,
+                                      color = if (i == themeIdx) p.textHi else p.textLo,
+                                      fontSize = 12.sp,
+                                      modifier = Modifier.padding(top = 6.dp)
+                                  )
+                              }
+                          }
+                      }
+                  }
+
+                  Panel {
+                      Title("Wallpaper")
+                      Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                          WALLPAPERS.forEachIndexed { i, w ->
+                              val colors = w.colors.ifEmpty { listOf(p.bgTop, p.bgBottom) }
+                              Box(
+                                  Modifier
+                                      .size(width = 72.dp, height = 104.dp)
+                                      .clip(RoundedCornerShape(14.dp))
+                                      .background(Brush.linearGradient(colors))
+                                      .border(if (i == wallIdx) 3.dp else 0.dp, p.textHi, RoundedCornerShape(14.dp))
+                                      .clickable { onWall(i) },
+                                  contentAlignment = Alignment.BottomCenter
+                              ) {
+                                  Text(w.name, color = Color.White, fontSize = 11.sp, modifier = Modifier.padding(6.dp))
+                              }
+                          }
+                          if (hasCustom) {
+                              Box(
+                                  Modifier
+                                      .size(width = 72.dp, height = 104.dp)
+                                      .clip(RoundedCornerShape(14.dp))
+                                      .background(p.textLo.copy(alpha = 0.35f))
+                                      .border(if (wallIdx == CUSTOM_WALL) 3.dp else 0.dp, p.textHi, RoundedCornerShape(14.dp))
+                                      .clickable { onWall(CUSTOM_WALL) },
+                                  contentAlignment = Alignment.BottomCenter
+                              ) {
+                                  Text("My photo", color = Color.White, fontSize = 11.sp, modifier = Modifier.padding(6.dp))
+                              }
+                          }
+                      }
+                      GhostButton("Choose a photo") { picker.launch("image/*") }
+                      if (message.isNotEmpty()) Body(message)
+                  }
+
+                  Panel {
+                      Title("About and privacy")
+                      Body(
+                          "Phone and SMS: dial *141*PIN# and *144#, and place calls or send texts only when you tap Call or Send. " +
+                              "Notifications and Screen reader: only look for 16-digit PINs; " +
+                              "nothing from them is stored or sent anywhere. Camera: scanner only. Internet: only the Wi-Fi " +
+                              "speed test. Network scan and Bluetooth sharing stay on your own devices."
+                      )
+                  }
+              }
+          }
+          EOF_7
+          cat > airtime/app/src/main/java/com/example/airtimeloader/MainActivity.kt <<'EOF_8'
+          package com.example.airtimeloader
+
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.SystemBarStyle
+          import androidx.activity.compose.setContent
+          import androidx.activity.enableEdgeToEdge
+          import androidx.compose.foundation.Image
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.Brush
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.ImageBitmap
+          import androidx.compose.ui.layout.ContentScale
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.unit.sp
+
+          class MainActivity : ComponentActivity() {
+
+              private var tick by mutableIntStateOf(0)
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  enableEdgeToEdge(
+                      statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+                      navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
+                  )
+                  setContent { App(tick) { tick++ } }
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  tick++
+              }
+          }
+
+          @Composable
+          private fun App(tick: Int, refresh: () -> Unit) {
+              val ctx = LocalContext.current
+              var themeIdx by remember { mutableIntStateOf(Look.theme(ctx)) }
+              var wallIdx by remember { mutableIntStateOf(Look.wallpaper(ctx)) }
+              var wallVersion by remember { mutableIntStateOf(Look.version(ctx)) }
+              var tab by remember { mutableIntStateOf(0) }
+
+              val palette = PALETTES[themeIdx]
+              val custom: ImageBitmap? = remember(wallVersion) {
+                  if (Look.hasCustom(ctx)) Look.loadCustom(ctx) else null
+              }
+
+              // Light themes need dark status-bar icons.
+              LaunchedEffect(palette.light) {
+                  val bar = if (palette.light) {
+                      SystemBarStyle.light(android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT)
+                  } else {
+                      SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
+                  }
+                  (ctx as? ComponentActivity)?.enableEdgeToEdge(statusBarStyle = bar, navigationBarStyle = bar)
+              }
+
+              val scheme = if (palette.light) {
+                  lightColorScheme(
+                      primary = palette.accent, onPrimary = palette.onAccent, background = palette.bgTop,
+                      surface = palette.card, onSurface = palette.textHi, outline = palette.accent
+                  )
+              } else {
+                  darkColorScheme(
+                      primary = palette.accent, onPrimary = palette.onAccent, background = palette.bgTop,
+                      surface = palette.card, onSurface = palette.textHi, outline = palette.accent
+                  )
+              }
+
+              CompositionLocalProvider(LocalPalette provides palette) {
+                  MaterialTheme(colorScheme = scheme) {
+                      Box(Modifier.fillMaxSize()) {
+                          Wallpaper(wallIdx, palette, custom)
+                          Column(Modifier.fillMaxSize()) {
+                              Box(Modifier.weight(1f).fillMaxWidth()) {
+                                  when (tab) {
+                                      0 -> HomeTab(tick, refresh)
+                                      1 -> DialTab()
+                                      2 -> ScanTab()
+                                      3 -> WifiTab()
+                                      4 -> ShareTab()
+                                      else -> LookTab(
+                                          themeIdx = themeIdx,
+                                          wallIdx = wallIdx,
+                                          hasCustom = Look.hasCustom(ctx),
+                                          onTheme = { themeIdx = it; Look.setTheme(ctx, it) },
+                                          onWall = { wallIdx = it; Look.setWallpaper(ctx, it) },
+                                          onCustomSaved = {
+                                              wallVersion = Look.version(ctx)
+                                              wallIdx = Look.wallpaper(ctx)
+                                          }
+                                      )
+                                  }
+                              }
+                              NavBar(tab) { tab = it }
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          private fun Wallpaper(idx: Int, p: Palette, custom: ImageBitmap?) {
+              Box(Modifier.fillMaxSize()) {
+                  if (idx == CUSTOM_WALL && custom != null) {
+                      Image(
+                          bitmap = custom,
+                          contentDescription = null,
+                          contentScale = ContentScale.Crop,
+                          modifier = Modifier.fillMaxSize()
+                      )
+                  } else {
+                      val colors = WALLPAPERS.getOrNull(idx)?.colors.orEmpty().ifEmpty { listOf(p.bgTop, p.bgBottom) }
+                      Box(Modifier.fillMaxSize().background(Brush.linearGradient(colors)))
+                  }
+                  // Keep text readable on photos and on dark wallpapers under a light theme.
+                  val scrim = when {
+                      idx == CUSTOM_WALL && custom != null -> if (p.light) Color(0xCCFFFFFF) else Color(0xAA000000)
+                      idx != 0 && p.light -> Color(0xCCFFFFFF)
+                      else -> Color.Transparent
+                  }
+                  Box(Modifier.fillMaxSize().background(scrim))
+              }
+          }
+
+          @Composable
+          private fun NavBar(tab: Int, onTab: (Int) -> Unit) {
+              val p = LocalPalette.current
+              val items = listOf("🏠" to "Home", "📞" to "Dial", "📷" to "Scan", "📶" to "Wi-Fi", "📤" to "Share", "🎨" to "Look")
+              NavigationBar(containerColor = p.card.copy(alpha = 0.94f)) {
+                  items.forEachIndexed { i, item ->
+                      NavigationBarItem(
+                          selected = tab == i,
+                          onClick = { onTab(i) },
+                          icon = { Text(item.first, fontSize = 18.sp) },
+                          label = {
+                              Text(item.second, fontSize = 10.sp, color = if (tab == i) p.accent else p.textLo)
+                          },
+                          colors = NavigationBarItemDefaults.colors(indicatorColor = p.accent.copy(alpha = 0.18f))
+                      )
+                  }
+              }
+          }
+          EOF_8
+          cat > airtime/app/src/main/java/com/example/airtimeloader/NetTabs.kt <<'EOF_9'
+          package com.example.airtimeloader
+
+          import android.bluetooth.BluetoothManager
+          import android.content.ClipData
+          import android.content.Context
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Handler
+          import android.os.Looper
+          import android.provider.OpenableColumns
+          import android.provider.Settings
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.shape.CircleShape
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import kotlinx.coroutines.delay
+          import java.util.Locale
+          import java.util.concurrent.atomic.AtomicBoolean
+
+          private fun num(v: Double?, unit: String): String =
+              if (v == null) "—" else String.format(Locale.US, "%.1f", v) + " " + unit
+
+          private fun lastOctet(ip: String): Int = ip.substringAfterLast('.').toIntOrNull() ?: 0
+
+          @Composable
+          fun WifiTab() {
+              val ctx = LocalContext.current
+              val p = LocalPalette.current
+              val main = remember { Handler(Looper.getMainLooper()) }
+
+              var snap by remember { mutableStateOf(NetTools.wifiSnapshot(ctx)) }
+              LaunchedEffect(Unit) {
+                  while (true) {
+                      snap = NetTools.wifiSnapshot(ctx)
+                      delay(3000)
+                  }
+              }
+
+              var speed by remember { mutableStateOf<SpeedState?>(null) }
+              var testing by remember { mutableStateOf(false) }
+              val speedCancel = remember { AtomicBoolean(false) }
+
+              var devices by remember { mutableStateOf(listOf<LanDevice>()) }
+              var scanning by remember { mutableStateOf(false) }
+              var progress by remember { mutableIntStateOf(0) }
+              var scanError by remember { mutableStateOf<String?>(null) }
+              val scanCancel = remember { AtomicBoolean(false) }
+
+              DisposableEffect(Unit) {
+                  onDispose {
+                      speedCancel.set(true)
+                      scanCancel.set(true)
+                  }
+              }
+
+              val st = speed
+
+              TabColumn {
+                  Header("Wi-Fi", "Speed test and who is connected")
+
+                  Panel {
+                      Title("Connection")
+                      if (!snap.onWifi) {
+                          Body("Not connected to Wi-Fi. Connect to a network to test it or see who is on it.")
+                      } else {
+                          Body("Network: " + (snap.ssid ?: "Wi-Fi (name hidden by Android)"))
+                          if (snap.linkMbps > 0) Body("Link speed: ${snap.linkMbps} Mbps")
+                          if (snap.signalDbm > -127) Body("Signal: ${snap.signalDbm} dBm")
+                          snap.ip?.let { Body("This phone: $it") }
+                          snap.gateway?.let { Body("Router: $it") }
+                      }
+                  }
+
+                  Panel {
+                      Title("Speed test")
+                      Body("Uses Cloudflare's public test servers. One run can use up to about 180 MB of data.")
+                      if (!snap.onWifi && snap.online) {
+                          Text("You are on mobile data: this test will use your data bundle.", color = p.warn, fontSize = 13.sp)
+                      }
+                      AccentButton(if (testing) "Stop" else "Start test", enabled = snap.online) {
+                          if (testing) {
+                              speedCancel.set(true)
+                          } else {
+                              speedCancel.set(false)
+                              testing = true
+                              speed = null
+                              Thread {
+                                  NetTools.runSpeedTest(speedCancel) { state -> main.post { speed = state } }
+                                  main.post { testing = false }
+                              }.start()
+                          }
+                      }
+                      if (st != null) {
+                          Body(st.phase)
+                          Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+                              Stat("Download", num(st.down, "Mbps"))
+                              Stat("Upload", num(st.up, "Mbps"))
+                              Stat("Ping", num(st.ping, "ms"))
+                          }
+                          if (st.jitter != null) Body("Jitter: " + num(st.jitter, "ms"))
+                          if (st.error != null) Text("Problem: ${st.error}", color = p.warn, fontSize = 13.sp)
+                      }
+                  }
+
+                  Panel {
+                      Title("Who is on my Wi-Fi")
+                      Body(
+                          "Scans your own Wi-Fi network for connected devices. Android hides MAC addresses, so brands " +
+                              "can't be shown, and phones that are asleep may not answer."
+                      )
+                      AccentButton(if (scanning) "Scanning… $progress%" else "Scan network", enabled = snap.onWifi && !scanning) {
+                          scanning = true
+                          devices = emptyList()
+                          progress = 0
+                          scanError = null
+                          scanCancel.set(false)
+                          Thread {
+                              try {
+                                  NetTools.scanLan(
+                                      ctx,
+                                      scanCancel,
+                                      onProgress = { done, total -> main.post { progress = done * 100 / total } },
+                                      onFound = { dev ->
+                                          main.post { devices = (devices + dev).sortedBy { lastOctet(it.ip) } }
+                                      }
+                                  )
+                              } catch (e: Exception) {
+                                  main.post { scanError = e.message ?: "Scan failed" }
+                              }
+                              main.post { scanning = false }
+                          }.start()
+                      }
+                      if (scanError != null) Text("Problem: $scanError", color = p.warn, fontSize = 13.sp)
+                      if (devices.isNotEmpty()) Body("${devices.size} device(s) found")
+                      devices.forEach { d ->
+                          Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                              Box(Modifier.size(10.dp).clip(CircleShape).background(p.accent))
+                              Spacer(Modifier.width(12.dp))
+                              Column(Modifier.weight(1f)) {
+                                  Text(d.name ?: d.ip, color = p.textHi, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                                  Text(
+                                      if (d.name != null) "${d.ip}  ·  ${d.note}" else d.note,
+                                      color = p.textLo, fontSize = 12.sp
+                                  )
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+
+          private fun btStatus(ctx: Context): String {
+              val adapter = ctx.getSystemService(BluetoothManager::class.java)?.adapter
+              return when {
+                  adapter == null -> "This device has no Bluetooth."
+                  adapter.isEnabled -> "Bluetooth is on."
+                  else -> "Bluetooth is off. Turn it on in Bluetooth settings."
+              }
+          }
+
+          private fun fileName(ctx: Context, uri: Uri): String {
+              val fromProvider = ctx.contentResolver
+                  .query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+                  ?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
+              return fromProvider ?: uri.lastPathSegment ?: "file"
+          }
+
+          /** Hands the files to Android's own Bluetooth transfer, so the other device needs no app. */
+          private fun sendViaBluetooth(ctx: Context, uris: List<Uri>) {
+              if (uris.isEmpty()) return
+              val intent = if (uris.size == 1) {
+                  Intent(Intent.ACTION_SEND).apply {
+                      type = ctx.contentResolver.getType(uris[0]) ?: "*/*"
+                      putExtra(Intent.EXTRA_STREAM, uris[0])
+                  }
+              } else {
+                  Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+                      type = "*/*"
+                      putParcelableArrayListExtra(Intent.EXTRA_STREAM, ArrayList(uris))
+                  }
+              }
+              intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+              val clip = ClipData.newUri(ctx.contentResolver, "files", uris[0])
+              for (u in uris.drop(1)) clip.addItem(ClipData.Item(u))
+              intent.clipData = clip
+
+              for (pkg in listOf("com.android.bluetooth", "com.google.android.bluetooth")) {
+                  try {
+                      ctx.startActivity(Intent(intent).setClassName(pkg, "com.android.bluetooth.opp.BluetoothOppLauncherActivity"))
+                      return
+                  } catch (e: Exception) {
+                      // try the next package name
+                  }
+              }
+              try {
+                  ctx.startActivity(Intent.createChooser(intent, "Send via Bluetooth"))
+              } catch (e: Exception) {
+                  // nothing can handle it
+              }
+          }
+
+          @Composable
+          fun ShareTab() {
+              val ctx = LocalContext.current
+              var picked by remember { mutableStateOf(listOf<Uri>()) }
+              var btText by remember { mutableStateOf(btStatus(ctx)) }
+              LaunchedEffect(Unit) {
+                  while (true) {
+                      btText = btStatus(ctx)
+                      delay(2000)
+                  }
+              }
+              val picker =
+                  rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris -> picked = uris }
+
+              TabColumn {
+                  Header("Share", "Send files over Bluetooth")
+
+                  Panel {
+                      Title("Bluetooth")
+                      Body(btText)
+                      GhostButton("Open Bluetooth settings") {
+                          try {
+                              ctx.startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS))
+                          } catch (e: Exception) {
+                              // no settings screen
+                          }
+                      }
+                  }
+
+                  Panel {
+                      Title("Send files")
+                      Body(
+                          "Pick one or more files, then choose the phone or PC to send them to. This uses Android's own " +
+                              "Bluetooth transfer, so the other device needs no app."
+                      )
+                      AccentButton("Choose files") { picker.launch(arrayOf("*/*")) }
+                      if (picked.isNotEmpty()) {
+                          Body(
+                              picked.take(5).joinToString("\n") { "• " + fileName(ctx, it) } +
+                                  (if (picked.size > 5) "\n…and ${picked.size - 5} more" else "")
+                          )
+                          AccentButton("Send ${picked.size} file(s) via Bluetooth") { sendViaBluetooth(ctx, picked) }
+                      }
+                  }
+
+                  Panel {
+                      Title("Receive files")
+                      Body(
+                          "Turn Bluetooth on, open Bluetooth settings and keep that screen open so other devices can find " +
+                              "this phone. Accept the incoming file prompt; received files land in your Downloads or " +
+                              "Bluetooth folder."
+                      )
+                  }
+              }
+          }
+          EOF_9
+          cat > airtime/app/src/main/java/com/example/airtimeloader/NetTools.kt <<'EOF_10'
+          package com.example.airtimeloader
+
+          import android.content.Context
+          import android.net.ConnectivityManager
+          import android.net.NetworkCapabilities
+          import android.net.wifi.WifiManager
+          import java.io.IOException
+          import java.net.ConnectException
+          import java.net.HttpURLConnection
+          import java.net.Inet4Address
+          import java.net.InetAddress
+          import java.net.InetSocketAddress
+          import java.net.Socket
+          import java.net.URL
+          import java.util.Random
+          import java.util.concurrent.Callable
+          import java.util.concurrent.ExecutorService
+          import java.util.concurrent.Executors
+          import java.util.concurrent.TimeUnit
+          import java.util.concurrent.atomic.AtomicBoolean
+          import java.util.concurrent.atomic.AtomicInteger
+          import java.util.concurrent.atomic.AtomicLong
+          import kotlin.math.abs
+
+          class WifiSnapshot(
+              val onWifi: Boolean,
+              val online: Boolean,
+              val ssid: String?,
+              val linkMbps: Int,
+              val signalDbm: Int,
+              val ip: String?,
+              val gateway: String?
+          )
+
+          data class SpeedState(
+              val phase: String,
+              val ping: Double? = null,
+              val jitter: Double? = null,
+              val down: Double? = null,
+              val up: Double? = null,
+              val error: String? = null
+          )
+
+          class LanDevice(val ip: String, val name: String?, val note: String)
+
+          /** Wi-Fi information, a speed test against Cloudflare's public test servers, and a scan of the local network. */
+          object NetTools {
+              private const val DOWN = "https://speed.cloudflare.com/__down?bytes="
+              private const val UP = "https://speed.cloudflare.com/__up"
+              private val PORTS = intArrayOf(80, 443, 53, 445, 8080, 62078)
+
+              @Suppress("DEPRECATION")
+              fun wifiSnapshot(ctx: Context): WifiSnapshot {
+                  val app = ctx.applicationContext
+                  val cm = app.getSystemService(ConnectivityManager::class.java)
+                      ?: return WifiSnapshot(false, false, null, -1, -127, null, null)
+                  val net = cm.activeNetwork
+                  val caps = if (net != null) cm.getNetworkCapabilities(net) else null
+                  val props = if (net != null) cm.getLinkProperties(net) else null
+                  val onWifi = caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+                  val online = caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true
+
+                  var ip: String? = null
+                  var gateway: String? = null
+                  if (props != null) {
+                      for (la in props.linkAddresses) {
+                          val a = la.address
+                          if (a is Inet4Address) { ip = a.hostAddress; break }
+                      }
+                      for (r in props.routes) {
+                          val g = r.gateway
+                          if (r.isDefaultRoute && g is Inet4Address) { gateway = g.hostAddress; break }
+                      }
+                  }
+                  val info = if (onWifi) app.getSystemService(WifiManager::class.java)?.connectionInfo else null
+                  val ssid = info?.ssid?.trim('"')?.takeIf { it.isNotBlank() && !it.contains("unknown ssid") }
+                  return WifiSnapshot(onWifi, online, ssid, info?.linkSpeed ?: -1, info?.rssi ?: -127, ip, gateway)
+              }
+
+              private fun http(url: String, timeoutMs: Int): HttpURLConnection {
+                  val c = URL(url).openConnection() as HttpURLConnection
+                  c.connectTimeout = timeoutMs
+                  c.readTimeout = timeoutMs
+                  c.useCaches = false
+                  c.setRequestProperty("Cache-Control", "no-cache")
+                  return c
+              }
+
+              /** Runs on the calling (background) thread and reports progress through [onUpdate]. */
+              fun runSpeedTest(cancel: AtomicBoolean, onUpdate: (SpeedState) -> Unit) {
+                  var ping: Double? = null
+                  var jitter: Double? = null
+                  var down: Double? = null
+                  var up: Double? = null
+                  fun push(phase: String, liveDown: Double? = null, liveUp: Double? = null, error: String? = null) {
+                      onUpdate(SpeedState(phase, ping, jitter, liveDown ?: down, liveUp ?: up, error))
+                  }
+
+                  try {
+                      push("Measuring latency…")
+                      val samples = ArrayList<Double>()
+                      for (i in 0 until 7) {
+                          if (cancel.get()) { push("Stopped"); return }
+                          val t0 = System.nanoTime()
+                          val c = http(DOWN + "0", 6000)
+                          try {
+                              c.inputStream.use { it.readBytes() }
+                          } finally {
+                              c.disconnect()
+                          }
+                          samples.add((System.nanoTime() - t0) / 1e6)
+                      }
+                      val s = if (samples.size > 2) samples.drop(1) else samples
+                      ping = s.minOrNull()
+                      var diff = 0.0
+                      for (i in 1 until s.size) diff += abs(s[i] - s[i - 1])
+                      jitter = if (s.size > 1) diff / (s.size - 1) else 0.0
+
+                      push("Testing download…")
+                      val d = measure(false, cancel, 8, 120_000_000L) { mbps -> push("Testing download…", liveDown = mbps) }
+                      if (cancel.get()) { push("Stopped"); return }
+                      if (d <= 0.0) throw IOException("Could not download from the test server")
+                      down = d
+
+                      push("Testing upload…")
+                      val u = measure(true, cancel, 6, 60_000_000L) { mbps -> push("Testing upload…", liveUp = mbps) }
+                      if (cancel.get()) { push("Stopped"); return }
+                      up = if (u > 0.0) u else null
+
+                      push("Done")
+                  } catch (e: Exception) {
+                      push("Test failed", error = e.message ?: e.javaClass.simpleName)
+                  }
+              }
+
+              /** Several parallel streams for [seconds] seconds; returns the average Mbps. */
+              private fun measure(
+                  upload: Boolean,
+                  cancel: AtomicBoolean,
+                  seconds: Int,
+                  capBytes: Long,
+                  onTick: (Double) -> Unit
+              ): Double {
+                  val total = AtomicLong(0)
+                  val start = System.nanoTime()
+                  val deadline = start + seconds * 1_000_000_000L
+                  val pool = Executors.newFixedThreadPool(3)
+                  repeat(3) {
+                      pool.execute {
+                          try {
+                              if (upload) uploadLoop(total, cancel, deadline, capBytes)
+                              else downloadLoop(total, cancel, deadline, capBytes)
+                          } catch (e: Exception) {
+                              // one stream failing is fine
+                          }
+                      }
+                  }
+                  pool.shutdown()
+
+                  var lastBytes = 0L
+                  var lastTime = start
+                  while (!pool.isTerminated && !cancel.get()) {
+                      Thread.sleep(300)
+                      val now = System.nanoTime()
+                      val bytes = total.get()
+                      val dt = (now - lastTime) / 1e9
+                      if (dt > 0) onTick((bytes - lastBytes) * 8.0 / dt / 1e6)
+                      lastBytes = bytes
+                      lastTime = now
+                  }
+                  pool.awaitTermination(3, TimeUnit.SECONDS)
+                  val secs = (System.nanoTime() - start) / 1e9
+                  return if (secs > 0) total.get() * 8.0 / secs / 1e6 else 0.0
+              }
+
+              private fun downloadLoop(total: AtomicLong, cancel: AtomicBoolean, deadline: Long, cap: Long) {
+                  val buf = ByteArray(64 * 1024)
+                  while (!cancel.get() && System.nanoTime() < deadline && total.get() < cap) {
+                      val c = http(DOWN + "25000000", 8000)
+                      try {
+                          c.inputStream.use { ins ->
+                              while (!cancel.get() && System.nanoTime() < deadline && total.get() < cap) {
+                                  val n = ins.read(buf)
+                                  if (n < 0) break
+                                  total.addAndGet(n.toLong())
+                              }
+                          }
+                      } finally {
+                          c.disconnect()
+                      }
+                  }
+              }
+
+              private fun uploadLoop(total: AtomicLong, cancel: AtomicBoolean, deadline: Long, cap: Long) {
+                  val chunk = ByteArray(64 * 1024)
+                  Random().nextBytes(chunk)
+                  val perRequest = 1_500_000
+                  while (!cancel.get() && System.nanoTime() < deadline && total.get() < cap) {
+                      val c = http(UP, 8000)
+                      try {
+                          c.requestMethod = "POST"
+                          c.doOutput = true
+                          c.setFixedLengthStreamingMode(perRequest)
+                          c.setRequestProperty("Content-Type", "application/octet-stream")
+                          c.outputStream.use { out ->
+                              var sent = 0
+                              while (sent < perRequest && !cancel.get()) {
+                                  val n = minOf(chunk.size, perRequest - sent)
+                                  out.write(chunk, 0, n)
+                                  sent += n
+                                  total.addAndGet(n.toLong())
+                              }
+                          }
+                          if (c.responseCode >= 400) throw IOException("Upload server answered ${c.responseCode}")
+                      } finally {
+                          c.disconnect()
+                      }
+                  }
+              }
+
+              /**
+               * Looks for devices on the Wi-Fi network (the /24 around this phone's address). A device counts as
+               * present if it answers a ping or any of a few TCP ports (even with "refused"). Blocks until done.
+               */
+              fun scanLan(
+                  ctx: Context,
+                  cancel: AtomicBoolean,
+                  onProgress: (Int, Int) -> Unit,
+                  onFound: (LanDevice) -> Unit
+              ) {
+                  val snap = wifiSnapshot(ctx)
+                  val myIp = snap.ip ?: throw IOException("Not connected to Wi-Fi")
+                  if (!snap.onWifi) throw IOException("Not connected to Wi-Fi")
+                  val parts = myIp.split(".")
+                  if (parts.size != 4) throw IOException("Unexpected IP address")
+                  val prefix = parts.take(3).joinToString(".")
+                  val hosts = (1..254).map { "$prefix.$it" }
+
+                  val pool = Executors.newFixedThreadPool(48)
+                  val dns = Executors.newCachedThreadPool()
+                  val done = AtomicInteger(0)
+                  for (ip in hosts) {
+                      pool.execute {
+                          try {
+                              if (!cancel.get()) {
+                                  val device = probe(ip, myIp, snap.gateway, dns)
+                                  if (device != null) onFound(device)
+                              }
+                          } catch (e: Exception) {
+                              // skip this address
+                          }
+                          onProgress(done.incrementAndGet(), hosts.size)
+                      }
+                  }
+                  pool.shutdown()
+                  pool.awaitTermination(90, TimeUnit.SECONDS)
+                  dns.shutdownNow()
+              }
+
+              private fun probe(ip: String, myIp: String, gateway: String?, dns: ExecutorService): LanDevice? {
+                  val addr = InetAddress.getByName(ip)
+                  var alive = ip == myIp
+                  if (!alive && addr.isReachable(250)) alive = true
+                  val openPorts = ArrayList<Int>()
+                  for (port in PORTS) {
+                      val s = Socket()
+                      try {
+                          s.connect(InetSocketAddress(addr, port), 220)
+                          alive = true
+                          openPorts.add(port)
+                      } catch (e: ConnectException) {
+                          // "connection refused" still proves a device is there
+                          if (e.message?.contains("refused", ignoreCase = true) == true) alive = true
+                      } catch (e: IOException) {
+                          // timed out or unreachable: nothing answered on this port
+                      } finally {
+                          try { s.close() } catch (e: IOException) { }
+                      }
+                  }
+                  if (!alive && ip != gateway) return null
+
+                  var name: String? = null
+                  val lookup = dns.submit(Callable { addr.canonicalHostName })
+                  try {
+                      val n = lookup.get(1200, TimeUnit.MILLISECONDS)
+                      if (n != null && n != ip) name = n
+                  } catch (e: Exception) {
+                      lookup.cancel(true)
+                  }
+
+                  val notes = ArrayList<String>()
+                  if (ip == myIp) notes.add("This phone")
+                  if (ip == gateway) notes.add("Router")
+                  if (80 in openPorts || 443 in openPorts || 8080 in openPorts) notes.add("Web page")
+                  if (53 in openPorts) notes.add("DNS")
+                  if (445 in openPorts) notes.add("File sharing")
+                  if (62078 in openPorts) notes.add("Likely an iPhone or iPad")
+                  if (notes.isEmpty()) notes.add("Device")
+                  return LanDevice(ip, name, notes.joinToString(" · "))
+              }
+          }
+          EOF_10
+          cat > airtime/app/src/main/java/com/example/airtimeloader/Ocr.kt <<'EOF_11'
+          package com.example.airtimeloader
+
+          import android.graphics.Bitmap
+          import com.google.android.gms.tasks.Task
+          import com.google.mlkit.vision.common.InputImage
+          import com.google.mlkit.vision.text.Text
+          import com.google.mlkit.vision.text.TextRecognition
+          import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+
+          /** On-device text recognition that returns any 16-digit PINs found in an image. */
+          object Ocr {
+              private val recognizer by lazy { TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS) }
+
+              /** Loads the text model ahead of time so the first real scan is fast. */
+              fun warmUp() {
+                  val blank = Bitmap.createBitmap(32, 32, Bitmap.Config.ARGB_8888)
+                  recognizer.process(InputImage.fromBitmap(blank, 0))
+              }
+
+              /** Raw recognizer result, used for live camera frames. */
+              fun process(image: InputImage): Task<Text> = recognizer.process(image)
+
+              /** Calls [onDone] on the main thread with the PINs read, or with an error. */
+              fun pinsIn(image: InputImage, onDone: (List<String>, Exception?) -> Unit) {
+                  recognizer.process(image)
+                      .addOnSuccessListener { result ->
+                          val pins = result.textBlocks
+                              .flatMap { it.lines }
+                              .flatMap { Pins.fromOcrLine(it.text) }
+                              .distinct()
+                          onDone(pins, null)
+                      }
+                      .addOnFailureListener { e -> onDone(emptyList(), e) }
+              }
+          }
+          EOF_11
+          cat > airtime/app/src/main/java/com/example/airtimeloader/PinListenerService.kt <<'EOF_12'
+          package com.example.airtimeloader
+
+          import android.Manifest
+          import android.app.Notification
+          import android.content.ContentUris
+          import android.content.pm.PackageManager
+          import android.database.ContentObserver
+          import android.graphics.Bitmap
+          import android.graphics.drawable.BitmapDrawable
+          import android.graphics.drawable.Icon
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Handler
+          import android.os.Looper
+          import android.provider.MediaStore
+          import android.service.notification.NotificationListenerService
+          import android.service.notification.StatusBarNotification
+          import androidx.core.content.ContextCompat
+          import com.google.mlkit.vision.common.InputImage
+          import java.util.concurrent.Executors
+
+          /**
+           * Reads WhatsApp notifications that mention SOURCE_WORD and hands any 16-digit airtime PIN to
+           * the Redeemer. PINs are found in the notification text, in a picture attached to the
+           * notification, and in WhatsApp photos that land in the gallery within PHOTO_WINDOW_MS of such a post.
+           * Nothing from the notifications is stored or sent anywhere.
+           */
+          class PinListenerService : NotificationListenerService() {
+
+              private companion object {
+                  // ---- tweak these ----
+                  const val SOURCE_WORD = "safaricom"         // must appear in the notification; "" = any WhatsApp notification
+                  const val PHOTO_WINDOW_MS = 90_000L         // how long after a Safaricom post new photos are read
+                  const val MEDIA_BUCKET_WORD = "whatsapp"    // gallery folder name must contain this
+
+                  val WHATSAPP = setOf("com.whatsapp", "com.whatsapp.w4b")
+              }
+
+              private val main = Handler(Looper.getMainLooper())
+              private val io = Executors.newSingleThreadExecutor()
+              private val seenImages = HashSet<Long>()
+              private var photoWindowUntil = 0L
+
+              private val mediaObserver = object : ContentObserver(main) {
+                  override fun onChange(selfChange: Boolean, uri: Uri?) {
+                      if (System.currentTimeMillis() <= photoWindowUntil) scanRecentImages()
+                  }
+              }
+
+              override fun onListenerConnected() {
+                  Ocr.warmUp()
+                  contentResolver.unregisterContentObserver(mediaObserver)
+                  contentResolver.registerContentObserver(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, true, mediaObserver)
+              }
+
+              override fun onListenerDisconnected() {
+                  contentResolver.unregisterContentObserver(mediaObserver)
+              }
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  contentResolver.unregisterContentObserver(mediaObserver)
+                  io.shutdown()
+              }
+
+              override fun onNotificationPosted(sbn: StatusBarNotification) {
+                  if (sbn.packageName !in WHATSAPP) return
+                  val extras = sbn.notification.extras
+                  val text = listOfNotNull(
+                      extras.getCharSequence(Notification.EXTRA_TITLE),
+                      extras.getCharSequence(Notification.EXTRA_TEXT),
+                      extras.getCharSequence(Notification.EXTRA_BIG_TEXT),
+                      extras.getCharSequenceArray(Notification.EXTRA_TEXT_LINES)?.joinToString("\n")
+                  ).joinToString("\n")
+                  if (!text.contains(SOURCE_WORD, ignoreCase = true)) return
+
+                  photoWindowUntil = System.currentTimeMillis() + PHOTO_WINDOW_MS
+                  val textPins = Pins.fromText(text)
+                  val picture = notificationPicture(sbn.notification)
+                  Store.log(this, "Safaricom post: ${textPins.size} PIN(s) in text, picture in notification: ${picture != null}")
+                  Redeemer.enqueue(this, textPins)
+                  if (picture != null) readImage(InputImage.fromBitmap(picture, 0), "Notification")
+              }
+
+              @Suppress("DEPRECATION")
+              private fun notificationPicture(n: Notification): Bitmap? {
+                  val extras = n.extras
+                  extras.getParcelable<Bitmap>(Notification.EXTRA_PICTURE)?.let { return it }
+                  if (Build.VERSION.SDK_INT >= 31) {
+                      val icon = extras.getParcelable<Icon>(Notification.EXTRA_PICTURE_ICON)
+                      val drawable = try { icon?.loadDrawable(this) } catch (e: Exception) { null }
+                      (drawable as? BitmapDrawable)?.bitmap?.let { return it }
+                  }
+                  return null
+              }
+
+              /** Called when a new image appears in the gallery shortly after a Safaricom post. */
+              private fun scanRecentImages() {
+                  val perm = if (Build.VERSION.SDK_INT >= 33) {
+                      Manifest.permission.READ_MEDIA_IMAGES
+                  } else {
+                      Manifest.permission.READ_EXTERNAL_STORAGE
+                  }
+                  if (ContextCompat.checkSelfPermission(this, perm) != PackageManager.PERMISSION_GRANTED) {
+                      Store.log(this, "New photo seen but photo access is not granted")
+                      return
+                  }
+
+                  val since = System.currentTimeMillis() / 1000 - 120
+                  val found = ArrayList<Pair<Long, String>>()
+                  try {
+                      contentResolver.query(
+                          MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                          arrayOf(MediaStore.Images.Media._ID, MediaStore.Images.Media.BUCKET_DISPLAY_NAME),
+                          "${MediaStore.Images.Media.DATE_ADDED} >= ?",
+                          arrayOf(since.toString()),
+                          "${MediaStore.Images.Media.DATE_ADDED} DESC"
+                      )?.use { c ->
+                          while (c.moveToNext()) {
+                              found.add(c.getLong(0) to (c.getString(1) ?: ""))
+                          }
+                      }
+                  } catch (e: Exception) {
+                      Store.log(this, "Could not list photos: ${e.javaClass.simpleName}")
+                      return
+                  }
+
+                  for ((id, bucket) in found) {
+                      if (!seenImages.add(id)) continue
+                      if (!bucket.contains(MEDIA_BUCKET_WORD, ignoreCase = true)) {
+                          Store.log(this, "Photo in \"$bucket\" skipped (not a WhatsApp folder)")
+                          continue
+                      }
+                      val uri = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id)
+                      io.execute {
+                          try {
+                              readImage(InputImage.fromFilePath(this, uri), "WhatsApp")
+                          } catch (e: Exception) {
+                              main.post { Store.log(this, "Could not open photo: ${e.javaClass.simpleName}") }
+                          }
+                      }
+                  }
+              }
+
+              private fun readImage(image: InputImage, label: String) {
+                  Ocr.pinsIn(image) { pins, err ->
+                      if (err != null) {
+                          Store.log(this, "$label photo: reading failed (${err.javaClass.simpleName})")
+                      } else {
+                          Store.log(this, "$label photo: ${pins.size} PIN(s) read")
+                          Redeemer.enqueue(this, pins)
+                      }
+                  }
+              }
+          }
+          EOF_12
+          cat > airtime/app/src/main/java/com/example/airtimeloader/Pins.kt <<'EOF_13'
+          package com.example.airtimeloader
+
+          /** Finds 16-digit airtime PINs in plain text or in OCR output. */
+          object Pins {
+              private val PIN = Regex("""(?<!\d)(\d{4})[ \u00A0-]?(\d{4})[ \u00A0-]?(\d{4})[ \u00A0-]?(\d{4})(?!\d)""")
+
+              fun fromText(text: String): List<String> =
+                  PIN.findAll(text).map { m -> m.groupValues.drop(1).joinToString("") }.distinct().toList()
+
+              /** OCR often confuses O/0 and I/l/1, so fix those on lines that are mostly digits. */
+              fun fromOcrLine(line: String): List<String> {
+                  if (line.count { it.isDigit() } < 12) return emptyList()
+                  val fixed = line.map { c ->
+                      when (c) {
+                          'O', 'o' -> '0'
+                          'I', 'l', '|' -> '1'
+                          else -> c
+                      }
+                  }.joinToString("")
+                  return fromText(fixed)
+              }
+
+              fun pretty(pin: String): String = pin.chunked(4).joinToString(" ")
+          }
+          EOF_13
+          cat > airtime/app/src/main/java/com/example/airtimeloader/Redeemer.kt <<'EOF_14'
+          package com.example.airtimeloader
+
+          import android.content.Context
+          import android.os.Handler
+          import android.os.Looper
+
+          /** Redeems PINs one at a time with the Safaricom top-up code *141*PIN#. Shared by every PIN source. */
+          object Redeemer {
+              // ---- tweak these ----
+              private const val MAX_FAILED_PINS = 3               // stop after this many rejected PINs in one run
+              private const val STOP_AFTER_FIRST_SUCCESS = true   // false = keep going and use every valid PIN
+
+              // Words in Safaricom's reply that mean "PIN rejected" / "airtime loaded". These are guesses:
+              // check the in-app log and adjust them to the real reply texts.
+              private val REJECTED = Regex(
+                  "invalid|incorrect|not correct|wrong|already|been used|expired|not valid|exceeded|blocked|unable|fail|error|try again",
+                  RegexOption.IGNORE_CASE
+              )
+              private val CONFIRMED = Regex(
+                  "success|recharged|topped|top-up|top up|credited|loaded|received|new balance|airtime balance",
+                  RegexOption.IGNORE_CASE
+              )
+
+              private val main = Handler(Looper.getMainLooper())
+              private val queue = ArrayDeque<String>()
+              private var current: String? = null
+              private var failures = 0
+              private var accepted = false
+              private var confirmed = false
+              private var lastReply = ""
+
+              /** Queues PINs not tried before and starts redeeming. Returns how many were new. */
+              fun enqueue(ctx: Context, pins: List<String>): Int {
+                  if (Looper.myLooper() != Looper.getMainLooper()) {
+                      main.post { enqueue(ctx, pins) }
+                      return 0
+                  }
+                  val app = ctx.applicationContext
+                  val fresh = pins.distinct()
+                      .filter { !Store.wasTried(app, it) && it != current && it !in queue }
+                  if (fresh.isEmpty()) return 0
+                  queue.addAll(fresh)
+                  Alerts.progress(app, "Voucher found", "${fresh.size} new PIN(s) detected. Redeeming…")
+                  if (current == null) {
+                      failures = 0
+                      accepted = false
+                      confirmed = false
+                      lastReply = ""
+                      redeemNext(app)
+                  }
+                  return fresh.size
+              }
+
+              private fun redeemNext(ctx: Context) {
+                  val pin = queue.removeFirstOrNull()
+                  if (pin == null) { finishRun(ctx, null); return }
+                  current = pin
+                  val tag = "…" + pin.takeLast(4)   // PINs are masked in the log
+
+                  Ussd.send(
+                      ctx,
+                      "*141*$pin#",
+                      onReply = { raw -> handleReply(ctx, pin, tag, raw) },
+                      onError = { msg ->
+                          Store.log(ctx, "$tag: $msg")
+                          finishRun(ctx, "Could not send the PIN ($msg).")
+                      }
+                  )
+              }
+
+              private fun handleReply(ctx: Context, pin: String, tag: String, raw: String) {
+                  val reply = raw.replace('\n', ' ').trim()
+                  Store.markTried(ctx, pin)
+                  Store.log(ctx, "$tag: " + reply.take(110))
+                  lastReply = reply.take(160)
+                  val rejected = REJECTED.containsMatchIn(reply)
+                  if (rejected) {
+                      failures++
+                  } else {
+                      accepted = true
+                      if (CONFIRMED.containsMatchIn(reply)) confirmed = true
+                  }
+                  val done = (!rejected && STOP_AFTER_FIRST_SUCCESS) || failures >= MAX_FAILED_PINS
+                  if (done) {
+                      finishRun(ctx, null)
+                  } else {
+                      Alerts.progress(ctx, "PIN $tag rejected", "Trying the next one…")
+                      redeemNext(ctx)
+                  }
+              }
+
+              /** Ends the run, tells the user how it went, and refreshes the balance if a PIN was accepted. */
+              private fun finishRun(ctx: Context, error: String?) {
+                  val (title, text) = when {
+                      error != null -> "Could not redeem PIN" to error
+                      confirmed -> "Airtime loaded ✓" to lastReply
+                      accepted -> "PIN accepted" to "Safaricom replied: $lastReply. Check your balance."
+                      else -> "No PIN worked" to "$failures rejected. Last reply: $lastReply"
+                  }
+                  queue.clear()
+                  current = null
+                  Alerts.finish(ctx, title, text)
+                  if (error == null && accepted) Balance.refresh(ctx)
+              }
+          }
+          EOF_14
+          cat > airtime/app/src/main/java/com/example/airtimeloader/ScannerActivity.kt <<'EOF_15'
+          package com.example.airtimeloader
+
+          import android.Manifest
+          import android.content.ClipData
+          import android.content.ClipboardManager
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.net.Uri
+          import android.os.Bundle
+          import android.util.Size
+          import android.widget.Toast
+          import androidx.activity.ComponentActivity
+          import androidx.activity.SystemBarStyle
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.compose.setContent
+          import androidx.activity.enableEdgeToEdge
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.camera.core.Camera
+          import androidx.camera.core.CameraSelector
+          import androidx.camera.core.ImageAnalysis
+          import androidx.camera.core.ImageProxy
+          import androidx.camera.core.Preview
+          import androidx.camera.lifecycle.ProcessCameraProvider
+          import androidx.camera.view.PreviewView
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.border
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.font.FontFamily
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.compose.ui.viewinterop.AndroidView
+          import androidx.core.content.ContextCompat
+          import com.google.mlkit.vision.barcode.BarcodeScannerOptions
+          import com.google.mlkit.vision.barcode.BarcodeScanning
+          import com.google.mlkit.vision.barcode.common.Barcode
+          import com.google.mlkit.vision.common.InputImage
+          import java.util.concurrent.Executors
+
+          sealed class ScanResult {
+              class Card(val pin: String) : ScanResult()
+              class Code(val text: String, val format: String) : ScanResult()
+          }
+
+          /** Live camera scanner: reads scratch-card PINs (text recognition) or QR codes and barcodes. */
+          class ScannerActivity : ComponentActivity() {
+
+              companion object {
+                  const val EXTRA_MODE = "mode"
+                  const val MODE_CARD = 0
+                  const val MODE_CODE = 1
+              }
+
+              private val analysisExecutor = Executors.newSingleThreadExecutor()
+              private val barcodeScanner = BarcodeScanning.getClient(
+                  BarcodeScannerOptions.Builder().setBarcodeFormats(Barcode.FORMAT_ALL_FORMATS).build()
+              )
+              private var camera: Camera? = null
+
+              private var mode by mutableIntStateOf(MODE_CARD)
+              private var result by mutableStateOf<ScanResult?>(null)
+              private var torch by mutableStateOf(false)
+
+              @Volatile
+              private var currentMode = MODE_CARD
+
+              @Volatile
+              private var holding = false   // a result is on screen: pause analysis
+
+              private var candidate: String? = null
+              private var hits = 0
+              private var misses = 0
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  enableEdgeToEdge(
+                      statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+                      navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
+                  )
+                  setMode(intent.getIntExtra(EXTRA_MODE, MODE_CARD))
+                  setContent { ScannerScreen() }
+              }
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  analysisExecutor.shutdown()
+                  barcodeScanner.close()
+              }
+
+              private fun setMode(m: Int) {
+                  currentMode = m
+                  mode = m
+                  rescan()
+              }
+
+              private fun rescan() {
+                  result = null
+                  holding = false
+                  candidate = null
+                  hits = 0
+                  misses = 0
+              }
+
+              private fun toggleTorch() {
+                  torch = !torch
+                  camera?.cameraControl?.enableTorch(torch)
+              }
+
+              private fun startCamera(view: PreviewView) {
+                  val future = ProcessCameraProvider.getInstance(this)
+                  future.addListener({
+                      val provider = future.get()
+                      val preview = Preview.Builder().build()
+                      preview.setSurfaceProvider(view.surfaceProvider)
+                      val analysis = ImageAnalysis.Builder()
+                          .setTargetResolution(Size(1080, 1920))
+                          .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                          .build()
+                      analysis.setAnalyzer(analysisExecutor) { proxy -> analyze(proxy) }
+                      provider.unbindAll()
+                      camera = provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis)
+                  }, ContextCompat.getMainExecutor(this))
+              }
+
+              private fun analyze(proxy: ImageProxy) {
+                  val media = proxy.image
+                  if (media == null || holding) {
+                      proxy.close()
+                      return
+                  }
+                  val image = InputImage.fromMediaImage(media, proxy.imageInfo.rotationDegrees)
+                  if (currentMode == MODE_CARD) {
+                      Ocr.process(image)
+                          .addOnSuccessListener { t -> onText(t) }
+                          .addOnCompleteListener { proxy.close() }
+                  } else {
+                      barcodeScanner.process(image)
+                          .addOnSuccessListener { list -> onBarcodes(list) }
+                          .addOnCompleteListener { proxy.close() }
+                  }
+              }
+
+              /** A PIN must be read in two frames in a row before it is offered, to avoid misreads. */
+              private fun onText(text: com.google.mlkit.vision.text.Text) {
+                  if (holding || currentMode != MODE_CARD) return
+                  val pin = text.textBlocks
+                      .flatMap { it.lines }
+                      .flatMap { Pins.fromOcrLine(it.text) }
+                      .firstOrNull()
+                  if (pin == null) {
+                      misses++
+                      if (misses > 6) {
+                          candidate = null
+                          hits = 0
+                      }
+                      return
+                  }
+                  misses = 0
+                  if (pin == candidate) {
+                      hits++
+                  } else {
+                      candidate = pin
+                      hits = 1
+                  }
+                  if (hits >= 2) {
+                      holding = true
+                      result = ScanResult.Card(pin)
+                      candidate = null
+                      hits = 0
+                  }
+              }
+
+              private fun onBarcodes(list: List<Barcode>) {
+                  if (holding || currentMode != MODE_CODE) return
+                  val b = list.firstOrNull { !it.rawValue.isNullOrEmpty() } ?: return
+                  holding = true
+                  result = ScanResult.Code(b.rawValue.orEmpty(), formatName(b.format))
+              }
+
+              private fun formatName(format: Int): String = when (format) {
+                  Barcode.FORMAT_QR_CODE -> "QR code"
+                  Barcode.FORMAT_EAN_13 -> "EAN-13 barcode"
+                  Barcode.FORMAT_EAN_8 -> "EAN-8 barcode"
+                  Barcode.FORMAT_UPC_A -> "UPC-A barcode"
+                  Barcode.FORMAT_UPC_E -> "UPC-E barcode"
+                  Barcode.FORMAT_CODE_128 -> "Code 128 barcode"
+                  Barcode.FORMAT_CODE_39 -> "Code 39 barcode"
+                  Barcode.FORMAT_PDF417 -> "PDF417 code"
+                  Barcode.FORMAT_AZTEC -> "Aztec code"
+                  Barcode.FORMAT_DATA_MATRIX -> "Data Matrix code"
+                  else -> "Barcode"
+              }
+
+              private fun loadAirtime(pin: String) {
+                  Redeemer.enqueue(this, listOf(pin))
+                  Toast.makeText(this, "Loading airtime…", Toast.LENGTH_SHORT).show()
+                  finish()
+              }
+
+              private fun copyText(t: String) {
+                  getSystemService(ClipboardManager::class.java)?.setPrimaryClip(ClipData.newPlainText("Scan", t))
+                  Toast.makeText(this, "Copied", Toast.LENGTH_SHORT).show()
+              }
+
+              private fun openLink(t: String) {
+                  try {
+                      startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(t)))
+                  } catch (e: Exception) {
+                      Toast.makeText(this, "No app can open this", Toast.LENGTH_SHORT).show()
+                  }
+              }
+
+              private fun shareText(t: String) {
+                  val send = Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, t)
+                  startActivity(Intent.createChooser(send, null))
+              }
+
+              @Composable
+              private fun ScannerScreen() {
+                  val ctx = LocalContext.current
+                  val pal = remember { PALETTES[Look.theme(ctx)] }
+                  var permitted by remember {
+                      mutableStateOf(
+                          ContextCompat.checkSelfPermission(ctx, Manifest.permission.CAMERA) ==
+                              PackageManager.PERMISSION_GRANTED
+                      )
+                  }
+                  val launcher =
+                      rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok -> permitted = ok }
+                  LaunchedEffect(Unit) {
+                      if (!permitted) launcher.launch(Manifest.permission.CAMERA)
+                  }
+
+                  Box(Modifier.fillMaxSize().background(Color.Black)) {
+                      if (permitted) {
+                          AndroidView(
+                              modifier = Modifier.fillMaxSize(),
+                              factory = { c -> PreviewView(c).also { startCamera(it) } }
+                          )
+                      } else {
+                          Text(
+                              "Camera permission is needed to scan.",
+                              color = Color.White,
+                              modifier = Modifier.align(Alignment.Center).padding(24.dp)
+                          )
+                      }
+
+                      Column(
+                          Modifier.fillMaxWidth().statusBarsPadding().padding(16.dp),
+                          verticalArrangement = Arrangement.spacedBy(12.dp)
+                      ) {
+                          Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                              Chip("Scratch card", mode == MODE_CARD, pal) { setMode(MODE_CARD) }
+                              Chip("QR / barcode", mode == MODE_CODE, pal) { setMode(MODE_CODE) }
+                              Chip(if (torch) "Light on" else "Light", torch, pal) { toggleTorch() }
+                          }
+                          Text(
+                              if (mode == MODE_CARD) "Scratch off the coating, then hold the PIN inside the frame."
+                              else "Point the camera at a QR code or barcode.",
+                              color = Color.White,
+                              fontSize = 14.sp
+                          )
+                      }
+
+                      Box(
+                          Modifier
+                              .align(Alignment.Center)
+                              .fillMaxWidth(0.86f)
+                              .height(if (mode == MODE_CARD) 120.dp else 260.dp)
+                              .border(2.dp, Color.White.copy(alpha = 0.85f), RoundedCornerShape(18.dp))
+                      )
+
+                      val r = result
+                      if (r != null) {
+                          ResultSheet(r, pal, Modifier.align(Alignment.BottomCenter))
+                      }
+                  }
+              }
+
+              @Composable
+              private fun ResultSheet(r: ScanResult, pal: Palette, modifier: Modifier) {
+                  Surface(
+                      modifier = modifier.fillMaxWidth().navigationBarsPadding().padding(16.dp),
+                      shape = RoundedCornerShape(22.dp),
+                      color = pal.card
+                  ) {
+                      Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                          when (r) {
+                              is ScanResult.Card -> {
+                                  Text("PIN found", color = pal.textHi, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+                                  Text(
+                                      Pins.pretty(r.pin),
+                                      color = pal.accent, fontSize = 22.sp,
+                                      fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold
+                                  )
+                                  Text(
+                                      "Check these digits match the card, then load the airtime.",
+                                      color = pal.textLo, fontSize = 13.sp
+                                  )
+                                  Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                      Btn("Load airtime", pal, true) { loadAirtime(r.pin) }
+                                      Btn("Rescan", pal, false) { rescan() }
+                                  }
+                              }
+                              is ScanResult.Code -> {
+                                  Text(r.format, color = pal.textLo, fontSize = 13.sp)
+                                  Text(r.text, color = pal.textHi, fontSize = 16.sp, maxLines = 6)
+                                  Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                      Btn("Copy", pal, true) { copyText(r.text) }
+                                      if (r.text.startsWith("http", ignoreCase = true)) {
+                                          Btn("Open", pal, false) { openLink(r.text) }
+                                      }
+                                      Btn("Share", pal, false) { shareText(r.text) }
+                                  }
+                                  Btn("Scan again", pal, false) { rescan() }
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          private fun Chip(label: String, selected: Boolean, pal: Palette, onClick: () -> Unit) {
+              Surface(
+                  shape = RoundedCornerShape(50),
+                  color = if (selected) pal.accent else Color(0x99000000),
+                  modifier = Modifier.clickable { onClick() }
+              ) {
+                  Text(
+                      label,
+                      color = if (selected) pal.onAccent else Color.White,
+                      fontSize = 13.sp,
+                      fontWeight = FontWeight.SemiBold,
+                      modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)
+                  )
+              }
+          }
+
+          @Composable
+          private fun Btn(label: String, pal: Palette, primary: Boolean, onClick: () -> Unit) {
+              if (primary) {
+                  Button(
+                      onClick = onClick,
+                      colors = ButtonDefaults.buttonColors(containerColor = pal.accent, contentColor = pal.onAccent)
+                  ) { Text(label, fontWeight = FontWeight.SemiBold) }
+              } else {
+                  OutlinedButton(onClick = onClick) { Text(label, color = pal.accent) }
+              }
+          }
+          EOF_15
+          cat > airtime/app/src/main/java/com/example/airtimeloader/ScreenReaderService.kt <<'EOF_16'
+          package com.example.airtimeloader
+
+          import android.accessibilityservice.AccessibilityService
+          import android.graphics.Bitmap
+          import android.media.AudioAttributes
+          import android.media.AudioManager
+          import android.os.Build
+          import android.os.Handler
+          import android.os.Looper
+          import android.os.PowerManager
+          import android.os.SystemClock
+          import android.os.VibrationEffect
+          import android.os.Vibrator
+          import android.view.Display
+          import android.view.KeyEvent
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+          import android.widget.Toast
+          import androidx.core.content.ContextCompat
+          import com.google.mlkit.vision.common.InputImage
+          import java.util.concurrent.Executors
+
+          /**
+           * Press Volume Up twice quickly on any screen: the app reads the screen (the text on it, plus a
+           * screenshot run through on-device text recognition), finds 16-digit airtime PINs and redeems them.
+           * Nothing from the screen is stored or sent anywhere; only PIN-shaped numbers are used.
+           */
+          class ScreenReaderService : AccessibilityService() {
+
+              private companion object {
+                  const val DOUBLE_PRESS_MS = 400L
+                  const val MIN_SCAN_GAP_MS = 1500L
+                  const val SWALLOW_LIMIT_MS = 3000L
+              }
+
+              private val main = Handler(Looper.getMainLooper())
+              private val io = Executors.newSingleThreadExecutor()
+              private val streams = intArrayOf(
+                  AudioManager.STREAM_MUSIC, AudioManager.STREAM_RING, AudioManager.STREAM_VOICE_CALL
+              )
+              private val snapshot = IntArray(3) { -1 }
+              private var lastDownTime = -10_000L
+              private var swallowing = false
+              private var swallowStart = 0L
+              private var lastScan = -10_000L
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+
+              override fun onInterrupt() {}
+
+              override fun onServiceConnected() {
+                  super.onServiceConnected()
+                  Ocr.warmUp()
+                  Store.log(this, "Screen reader connected: double-press Volume Up to scan")
+              }
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  io.shutdown()
+              }
+
+              override fun onKeyEvent(event: KeyEvent): Boolean {
+                  if (event.keyCode != KeyEvent.KEYCODE_VOLUME_UP) return false
+
+                  // The second press is still held down: swallow it (and its repeats) until it is released.
+                  if (swallowing && event.eventTime - swallowStart > SWALLOW_LIMIT_MS) swallowing = false
+                  if (swallowing) {
+                      if (event.action == KeyEvent.ACTION_UP) swallowing = false
+                      return true
+                  }
+                  if (event.action != KeyEvent.ACTION_DOWN || event.repeatCount > 0) return false
+
+                  val t = event.eventTime   // time of the press itself, not of when we got to handle it
+                  if (t - lastDownTime <= DOUBLE_PRESS_MS) {
+                      lastDownTime = -10_000L
+                      if (getSystemService(PowerManager::class.java)?.isInteractive == false) return false
+                      swallowing = true
+                      swallowStart = t
+                      undoFirstPress()
+                      buzz()
+                      main.post { scanScreen() }   // keep this callback fast
+                      return true
+                  }
+                  lastDownTime = t
+                  rememberVolumes()
+                  return false   // the first press behaves normally
+              }
+
+              private fun rememberVolumes() {
+                  val am = getSystemService(AudioManager::class.java) ?: return
+                  for (i in streams.indices) {
+                      snapshot[i] = try { am.getStreamVolume(streams[i]) } catch (e: Exception) { -1 }
+                  }
+              }
+
+              /** The first press already raised the volume; put it back so the shortcut has no side effect. */
+              private fun undoFirstPress() {
+                  val am = getSystemService(AudioManager::class.java) ?: return
+                  for (i in streams.indices) {
+                      try {
+                          if (snapshot[i] >= 0 && am.getStreamVolume(streams[i]) > snapshot[i]) {
+                              am.adjustStreamVolume(streams[i], AudioManager.ADJUST_LOWER, 0)
+                          }
+                      } catch (e: Exception) {
+                          // e.g. Do Not Disturb rules; ignore
+                      }
+                  }
+              }
+
+              @Suppress("DEPRECATION")
+              private fun buzz() {
+                  try {
+                      val vibrator = getSystemService(Vibrator::class.java) ?: return
+                      val effect = VibrationEffect.createOneShot(40, VibrationEffect.DEFAULT_AMPLITUDE)
+                      val attrs = AudioAttributes.Builder()
+                          .setUsage(AudioAttributes.USAGE_ASSISTANCE_ACCESSIBILITY)
+                          .build()
+                      vibrator.vibrate(effect, attrs)
+                  } catch (e: Exception) {
+                      // no vibrator or not allowed; ignore
+                  }
+              }
+
+              private fun scanScreen() {
+                  val now = SystemClock.uptimeMillis()
+                  if (now - lastScan < MIN_SCAN_GAP_MS) return
+                  lastScan = now
+
+                  val scan = Scan()
+                  captureScreen(scan, 1)
+                  io.execute {
+                      val pins = pinsFromTree()
+                      main.post { scan.treeDone(pins) }
+                  }
+              }
+
+              /** Joins the two halves of a scan (on-screen text, screenshot) and reports once both are in. */
+              private inner class Scan {
+                  private var tree: List<String>? = null
+                  private var image: List<String>? = null
+                  private var note: String? = null
+                  private var queued = 0
+
+                  fun treeDone(pins: List<String>) {
+                      tree = pins
+                      queued += Redeemer.enqueue(this@ScreenReaderService, pins)
+                      finishIfReady()
+                  }
+
+                  fun imageDone(pins: List<String>, why: String?) {
+                      image = pins
+                      note = why
+                      queued += Redeemer.enqueue(this@ScreenReaderService, pins)
+                      finishIfReady()
+                  }
+
+                  private fun finishIfReady() {
+                      val t = tree ?: return
+                      val i = image ?: return
+                      report(t, i, note, queued)
+                  }
+              }
+
+              private fun captureScreen(scan: Scan, attempt: Int) {
+                  if (Build.VERSION.SDK_INT < 30) {
+                      scan.imageDone(emptyList(), "image scan needs Android 11+")
+                      return
+                  }
+                  takeScreenshot(
+                      Display.DEFAULT_DISPLAY,
+                      ContextCompat.getMainExecutor(this),
+                      object : AccessibilityService.TakeScreenshotCallback {
+                          override fun onSuccess(screenshot: AccessibilityService.ScreenshotResult) {
+                              val bitmap = toSoftwareBitmap(screenshot)
+                              if (bitmap == null) {
+                                  scan.imageDone(emptyList(), "screenshot could not be read")
+                                  return
+                              }
+                              Ocr.pinsIn(InputImage.fromBitmap(bitmap, 0)) { pins, err ->
+                                  scan.imageDone(pins, if (err != null) "text reading failed" else null)
+                              }
+                          }
+
+                          override fun onFailure(errorCode: Int) {
+                              if (errorCode == AccessibilityService.ERROR_TAKE_SCREENSHOT_INTERVAL_TIME_SHORT && attempt < 2) {
+                                  main.postDelayed({ captureScreen(scan, attempt + 1) }, 1100L)
+                              } else {
+                                  scan.imageDone(emptyList(), "screenshot error $errorCode")
+                              }
+                          }
+                      }
+                  )
+              }
+
+              private fun toSoftwareBitmap(s: AccessibilityService.ScreenshotResult): Bitmap? {
+                  val buffer = s.hardwareBuffer
+                  return try {
+                      Bitmap.wrapHardwareBuffer(buffer, s.colorSpace)?.copy(Bitmap.Config.ARGB_8888, false)
+                  } catch (e: Exception) {
+                      null
+                  } finally {
+                      buffer.close()
+                  }
+              }
+
+              /** Collects every piece of text on the current screen and keeps only PIN-shaped numbers. */
+              private fun pinsFromTree(): List<String> {
+                  val root = rootInActiveWindow ?: return emptyList()
+                  val found = LinkedHashSet<String>()
+                  var visited = 0
+                  fun walk(node: AccessibilityNodeInfo?, depth: Int) {
+                      if (node == null || depth > 80 || visited > 5000) return
+                      visited++
+                      node.text?.let { found.addAll(Pins.fromText(it.toString())) }
+                      node.contentDescription?.let { found.addAll(Pins.fromText(it.toString())) }
+                      for (i in 0 until node.childCount) walk(node.getChild(i), depth + 1)
+                  }
+                  walk(root, 0)
+                  return found.toList()
+              }
+
+              private fun report(fromTree: List<String>, fromImage: List<String>, note: String?, queued: Int) {
+                  val all = (fromTree + fromImage).distinct()
+                  Store.log(
+                      this,
+                      "Screen scan: ${all.size} PIN(s) (text ${fromTree.size}, image ${fromImage.size}, new $queued)" +
+                          (if (note != null) " - $note" else "")
+                  )
+                  when {
+                      all.isEmpty() ->
+                          Toast.makeText(this, "No PINs found on screen", Toast.LENGTH_SHORT).show()
+                      queued == 0 ->
+                          Alerts.finish(
+                              this,
+                              "Nothing new to redeem",
+                              "${all.size} PIN(s) on screen were already tried or are being redeemed."
+                          )
+                  }
+              }
+          }
+          EOF_16
+          cat > airtime/app/src/main/java/com/example/airtimeloader/Store.kt <<'EOF_17'
+          package com.example.airtimeloader
+
+          import android.content.Context
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+
+          /** Remembers which PINs were already tried and keeps a short on-screen log. */
+          object Store {
+              private fun prefs(ctx: Context) =
+                  ctx.getSharedPreferences("airtime_loader", Context.MODE_PRIVATE)
+
+              fun wasTried(ctx: Context, pin: String): Boolean =
+                  prefs(ctx).getStringSet("tried", emptySet())!!.contains(pin)
+
+              fun markTried(ctx: Context, pin: String) {
+                  val tried = prefs(ctx).getStringSet("tried", emptySet())!!.toMutableSet()
+                  tried.add(pin)
+                  prefs(ctx).edit().putStringSet("tried", tried).apply()
+              }
+
+              fun log(ctx: Context, line: String) {
+                  val stamp = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
+                  val old = prefs(ctx).getString("log", "").orEmpty().lines()
+                  val lines = (listOf("$stamp  $line") + old).filter { it.isNotBlank() }.take(30)
+                  prefs(ctx).edit().putString("log", lines.joinToString("\n")).apply()
+              }
+
+              fun readLog(ctx: Context): String = prefs(ctx).getString("log", "").orEmpty()
+
+              fun clearLog(ctx: Context) {
+                  prefs(ctx).edit().remove("log").apply()
+              }
+
+              fun clear(ctx: Context) {
+                  prefs(ctx).edit().clear().apply()
+              }
+          }
+          EOF_17
+          cat > airtime/app/src/main/java/com/example/airtimeloader/Tabs.kt <<'EOF_18'
+          package com.example.airtimeloader
+
+          import android.Manifest
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Handler
+          import android.os.Looper
+          import android.os.PowerManager
+          import android.provider.Settings
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.shape.CircleShape
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.graphics.Brush
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.core.app.NotificationManagerCompat
+          import androidx.core.content.ContextCompat
+          import com.google.mlkit.vision.common.InputImage
+          import kotlinx.coroutines.delay
+          import java.text.SimpleDateFormat
+          import java.time.LocalDateTime
+          import java.time.format.DateTimeFormatter
+          import java.util.Date
+          import java.util.Locale
+
+          val PHOTO_PERMISSION: String =
+              if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_IMAGES
+              else Manifest.permission.READ_EXTERNAL_STORAGE
+
+          private val TIME_FMT: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm:ss")
+          private val DATE_FMT: DateTimeFormatter = DateTimeFormatter.ofPattern("EEEE, d MMMM yyyy")
+
+          private class Check(
+              val title: String,
+              val hint: String,
+              val done: Boolean,
+              val action: String,
+              val onClick: () -> Unit
+          )
+
+          fun granted(ctx: Context, perm: String): Boolean =
+              ContextCompat.checkSelfPermission(ctx, perm) == PackageManager.PERMISSION_GRANTED
+
+          private fun accessibilityOn(ctx: Context): Boolean {
+              val enabled = Settings.Secure.getString(
+                  ctx.contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+              ) ?: return false
+              return enabled.contains("${ctx.packageName}/") && enabled.contains("ScreenReaderService")
+          }
+
+          private fun batteryOk(ctx: Context): Boolean =
+              ctx.getSystemService(PowerManager::class.java)?.isIgnoringBatteryOptimizations(ctx.packageName) == true
+
+          private fun openAppNotificationSettings(ctx: Context) {
+              try {
+                  ctx.startActivity(
+                      Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                          .putExtra(Settings.EXTRA_APP_PACKAGE, ctx.packageName)
+                  )
+              } catch (e: Exception) {
+                  // no settings screen available
+              }
+          }
+
+          /** Reads PINs from a chosen photo and shows them. Nothing is dialed. */
+          private fun testScan(ctx: Context, uri: Uri, onResult: (String) -> Unit) {
+              val main = Handler(Looper.getMainLooper())
+              onResult("Reading photo…")
+              Thread {
+                  try {
+                      val image = InputImage.fromFilePath(ctx, uri)
+                      Ocr.pinsIn(image) { pins, err ->
+                          onResult(
+                              when {
+                                  err != null -> "Reading failed: ${err.message}"
+                                  pins.isEmpty() -> "No 16-digit PINs found in that photo."
+                                  else -> "Found ${pins.size} PIN(s), test only (nothing dialed):\n" +
+                                      pins.joinToString("\n") { Pins.pretty(it) }
+                              }
+                          )
+                      }
+                  } catch (e: Exception) {
+                      main.post { onResult("Could not open that photo: ${e.message}") }
+                  }
+              }.start()
+          }
+
+          @Composable
+          fun HomeTab(tick: Int, refresh: () -> Unit) {
+              val ctx = LocalContext.current
+              val p = LocalPalette.current
+
+              val notifOn = remember(tick) {
+                  NotificationManagerCompat.getEnabledListenerPackages(ctx).contains(ctx.packageName)
+              }
+              val phoneOn = remember(tick) { granted(ctx, Manifest.permission.CALL_PHONE) }
+              val a11yOn = remember(tick) { accessibilityOn(ctx) }
+              val photoOn = remember(tick) { granted(ctx, PHOTO_PERMISSION) }
+              val batteryOn = remember(tick) { batteryOk(ctx) }
+              val alertsOn = remember(tick) {
+                  Build.VERSION.SDK_INT < 33 || granted(ctx, Manifest.permission.POST_NOTIFICATIONS)
+              }
+
+              var now by remember { mutableStateOf(LocalDateTime.now()) }
+              var balance by remember { mutableStateOf(Balance.last(ctx)) }
+              var checking by remember { mutableStateOf(Balance.busy) }
+              var log by remember { mutableStateOf(Store.readLog(ctx)) }
+              LaunchedEffect(Unit) {
+                  while (true) {
+                      now = LocalDateTime.now()
+                      balance = Balance.last(ctx)
+                      checking = Balance.busy
+                      log = Store.readLog(ctx)
+                      delay(1000)
+                  }
+              }
+              // Check the balance when the app opens, unless it was checked in the last 10 minutes.
+              LaunchedEffect(tick, phoneOn) {
+                  val last = Balance.last(ctx)
+                  if (phoneOn && (last == null || System.currentTimeMillis() - last.time > 10 * 60_000L)) {
+                      Balance.refresh(ctx)
+                  }
+              }
+
+              val phoneLauncher =
+                  rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { refresh() }
+              val photoLauncher =
+                  rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { refresh() }
+              val alertsLauncher =
+                  rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
+                      if (!ok) openAppNotificationSettings(ctx)
+                      refresh()
+                  }
+
+              fun launchSettings(action: String) {
+                  try {
+                      ctx.startActivity(Intent(action))
+                  } catch (e: Exception) {
+                      // settings screen not available
+                  }
+              }
+
+              val checks = listOf(
+                  Check("Notifications", "Reads Safaricom Care posts in WhatsApp", notifOn, "Enable") {
+                      launchSettings(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
+                  },
+                  Check("Phone", "Lets the app dial *141*PIN# and *144# for you", phoneOn, "Allow") {
+                      phoneLauncher.launch(Manifest.permission.CALL_PHONE)
+                  },
+                  Check("Alerts", "Tells you when a PIN is found and when airtime loads", alertsOn, "Allow") {
+                      if (Build.VERSION.SDK_INT >= 33) {
+                          alertsLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                      } else {
+                          openAppNotificationSettings(ctx)
+                      }
+                  },
+                  Check("Screen reader", "Double-press Volume Up to scan any screen", a11yOn, "Enable") {
+                      launchSettings(Settings.ACTION_ACCESSIBILITY_SETTINGS)
+                  },
+                  Check("Photos", "Reads giveaway photos WhatsApp saves (choose Allow all)", photoOn, "Allow") {
+                      photoLauncher.launch(PHOTO_PERMISSION)
+                  },
+                  Check("Background", "Keeps the app awake when the screen is off", batteryOn, "Allow") {
+                      try {
+                          ctx.startActivity(
+                              Intent(
+                                  Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                                  Uri.parse("package:${ctx.packageName}")
+                              )
+                          )
+                      } catch (e: Exception) {
+                          // not available on this phone
+                      }
+                  }
+              )
+              val doneCount = checks.count { it.done }
+              val b = balance
+
+              TabColumn {
+                  Header("Airtime Loader", "Catches Safaricom giveaway PINs the moment they appear")
+
+                  Panel {
+                      Text(now.format(TIME_FMT), color = p.textHi, fontSize = 44.sp, fontWeight = FontWeight.Bold)
+                      Body(now.format(DATE_FMT))
+                  }
+
+                  Panel {
+                      Body("Airtime balance")
+                      Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                          Column(Modifier.weight(1f)) {
+                              Text(
+                                  b?.amount?.let { "Ksh $it" } ?: "—",
+                                  color = p.accent, fontSize = 34.sp, fontWeight = FontWeight.Bold
+                              )
+                              Body(
+                                  if (b == null) "Not checked yet"
+                                  else "Updated " + SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(b.time))
+                              )
+                          }
+                          AccentButton(if (checking) "Checking…" else "Refresh", enabled = phoneOn && !checking) {
+                              Balance.refresh(ctx)
+                          }
+                      }
+                      if (!phoneOn) Body("Allow Phone permission below to check your balance.")
+                      if (b != null && b.amount == null && b.reply.isNotBlank()) Body("Safaricom said: ${b.reply}", mono = true)
+                  }
+
+                  Box(
+                      Modifier
+                          .fillMaxWidth()
+                          .clip(RoundedCornerShape(24.dp))
+                          .background(Brush.linearGradient(listOf(p.heroA, p.heroB)))
+                          .padding(20.dp)
+                  ) {
+                      Column {
+                          Text(
+                              if (notifOn && phoneOn) "Ready for the next giveaway" else "Finish setup to get started",
+                              color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.SemiBold
+                          )
+                          Spacer(Modifier.height(6.dp))
+                          Text("$doneCount of ${checks.size} steps complete", color = Color(0xFFCFF7E8), fontSize = 13.sp)
+                          Spacer(Modifier.height(14.dp))
+                          Box(
+                              Modifier
+                                  .fillMaxWidth()
+                                  .height(8.dp)
+                                  .clip(RoundedCornerShape(4.dp))
+                                  .background(Color(0x33FFFFFF))
+                          ) {
+                              Box(
+                                  Modifier
+                                      .fillMaxWidth(doneCount / checks.size.toFloat())
+                                      .fillMaxHeight()
+                                      .background(Color.White)
+                              )
+                          }
+                      }
+                  }
+
+                  Panel {
+                      Title("Setup")
+                      checks.forEach { c ->
+                          Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                              Box(
+                                  Modifier
+                                      .size(28.dp)
+                                      .clip(CircleShape)
+                                      .background(if (c.done) p.accent else p.textLo.copy(alpha = 0.25f)),
+                                  contentAlignment = Alignment.Center
+                              ) {
+                                  Text(
+                                      if (c.done) "✓" else "!",
+                                      color = if (c.done) p.onAccent else p.warn,
+                                      fontWeight = FontWeight.Bold
+                                  )
+                              }
+                              Spacer(Modifier.width(14.dp))
+                              Column(Modifier.weight(1f)) {
+                                  Text(c.title, color = p.textHi, fontWeight = FontWeight.SemiBold)
+                                  Text(c.hint, color = p.textLo, fontSize = 12.sp)
+                              }
+                              if (!c.done) {
+                                  TextButton(onClick = c.onClick) { Text(c.action, color = p.accent) }
+                              }
+                          }
+                      }
+                  }
+
+                  Panel {
+                      Title("Double-press Volume Up")
+                      Body(
+                          if (a11yOn) {
+                              "On any screen (a chat, a photo, a screenshot) press Volume Up twice quickly. " +
+                                  "You will feel a short buzz, then the app reads the screen, finds 16-digit PINs and redeems them."
+                          } else {
+                              "Turn on Screen reader above to enable this shortcut."
+                          }
+                      )
+                  }
+
+                  Panel {
+                      Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                          Text(
+                              "Activity", color = p.textHi, fontSize = 16.sp, fontWeight = FontWeight.SemiBold,
+                              modifier = Modifier.weight(1f)
+                          )
+                          TextButton(onClick = { Store.clearLog(ctx); log = "" }) {
+                              Text("Clear log", color = p.textLo, fontSize = 12.sp)
+                          }
+                          TextButton(onClick = { Store.clear(ctx); log = "" }) {
+                              Text("Reset all", color = p.textLo, fontSize = 12.sp)
+                          }
+                      }
+                      Body(if (log.isBlank()) "Nothing yet. Safaricom's replies will appear here." else log, mono = true)
+                  }
+
+                  TextButton(onClick = {
+                      try {
+                          ctx.startActivity(
+                              Intent(
+                                  Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                  Uri.fromParts("package", ctx.packageName, null)
+                              )
+                          )
+                      } catch (e: Exception) {
+                          // no app info screen
+                      }
+                  }) {
+                      Text(
+                          "Setting greyed out? Open app info, then the three-dot menu, then Allow restricted settings",
+                          color = p.textLo, fontSize = 12.sp
+                      )
+                  }
+              }
+          }
+
+          @Composable
+          fun ScanTab() {
+              val ctx = LocalContext.current
+              var testResult by remember { mutableStateOf("") }
+              val pickLauncher =
+                  rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+                      if (uri != null) testScan(ctx, uri) { testResult = it }
+                  }
+
+              fun start(mode: Int) {
+                  ctx.startActivity(Intent(ctx, ScannerActivity::class.java).putExtra(ScannerActivity.EXTRA_MODE, mode))
+              }
+
+              TabColumn {
+                  Header("Scan", "Scratch cards, QR codes and barcodes")
+
+                  Panel {
+                      Title("Scratch card")
+                      Body("Scratch off the coating, point the camera at the PIN, check the digits and load the airtime.")
+                      AccentButton("Scan a scratch card") { start(ScannerActivity.MODE_CARD) }
+                  }
+
+                  Panel {
+                      Title("QR code and barcode reader")
+                      Body("Reads QR codes and common barcodes. Open links, copy the text or share it.")
+                      AccentButton("Open reader") { start(ScannerActivity.MODE_CODE) }
+                  }
+
+                  Panel {
+                      Title("Read a photo")
+                      Body("Pick a photo or screenshot to see which PINs the app can read. Nothing is dialed.")
+                      GhostButton("Choose photo") { pickLauncher.launch("image/*") }
+                      if (testResult.isNotEmpty()) Body(testResult, mono = true)
+                  }
+              }
+          }
+          EOF_18
+          cat > airtime/app/src/main/java/com/example/airtimeloader/Theme.kt <<'EOF_19'
+          package com.example.airtimeloader
+
+          import androidx.compose.runtime.compositionLocalOf
+          import androidx.compose.ui.graphics.Color
+
+          class Palette(
+              val name: String,
+              val light: Boolean,
+              val bgTop: Color,
+              val bgBottom: Color,
+              val card: Color,
+              val accent: Color,
+              val onAccent: Color,
+              val textHi: Color,
+              val textLo: Color,
+              val warn: Color,
+              val heroA: Color,
+              val heroB: Color
+          )
+
+          val PALETTES: List<Palette> = listOf(
+              Palette(
+                  "Emerald", false, Color(0xFF0A1018), Color(0xFF0E2A2B), Color(0xFF151F2E), Color(0xFF34D399),
+                  Color(0xFF04120C), Color(0xFFF1F5F9), Color(0xFF93A3B8), Color(0xFFF5B83D), Color(0xFF0F766E), Color(0xFF065F46)
+              ),
+              Palette(
+                  "Ocean", false, Color(0xFF08111F), Color(0xFF0B2A4A), Color(0xFF12233A), Color(0xFF38BDF8),
+                  Color(0xFF03121F), Color(0xFFF1F5F9), Color(0xFF94A8C0), Color(0xFFF5B83D), Color(0xFF0369A1), Color(0xFF1E3A8A)
+              ),
+              Palette(
+                  "Sunset", false, Color(0xFF1A0F14), Color(0xFF3A1722), Color(0xFF2A1A22), Color(0xFFFB923C),
+                  Color(0xFF1A0B02), Color(0xFFFFF1E8), Color(0xFFC9A9A6), Color(0xFFFDE047), Color(0xFFC2410C), Color(0xFF9D174D)
+              ),
+              Palette(
+                  "Violet", false, Color(0xFF120E1F), Color(0xFF2A1B4D), Color(0xFF1E1833), Color(0xFFA78BFA),
+                  Color(0xFF140B2E), Color(0xFFF3F0FF), Color(0xFFA9A3C7), Color(0xFFF5B83D), Color(0xFF6D28D9), Color(0xFF4338CA)
+              ),
+              Palette(
+                  "Daylight", true, Color(0xFFF1F5F9), Color(0xFFDCE7F0), Color(0xFFFFFFFF), Color(0xFF0F766E),
+                  Color(0xFFFFFFFF), Color(0xFF0F172A), Color(0xFF475569), Color(0xFFB45309), Color(0xFF0F766E), Color(0xFF047857)
+              )
+          )
+
+          /** A wallpaper: an empty colour list means "follow the theme". */
+          class Wall(val name: String, val colors: List<Color>)
+
+          /** Wallpaper index meaning "my own photo". */
+          const val CUSTOM_WALL = 99
+
+          val WALLPAPERS: List<Wall> = listOf(
+              Wall("Theme", emptyList()),
+              Wall("Aurora", listOf(Color(0xFF0B1F2A), Color(0xFF0F5E63), Color(0xFF4C1D95))),
+              Wall("Dusk", listOf(Color(0xFF1E1B4B), Color(0xFF9D174D), Color(0xFFEA580C))),
+              Wall("Lagoon", listOf(Color(0xFF06202B), Color(0xFF0E7490), Color(0xFF34D399))),
+              Wall("Forest", listOf(Color(0xFF07130D), Color(0xFF14532D), Color(0xFF65A30D))),
+              Wall("Graphite", listOf(Color(0xFF0B0D12), Color(0xFF1F2430), Color(0xFF3B4252)))
+          )
+
+          val LocalPalette = compositionLocalOf { PALETTES[0] }
+          EOF_19
+          cat > airtime/app/src/main/java/com/example/airtimeloader/Ussd.kt <<'EOF_20'
+          package com.example.airtimeloader
+
+          import android.Manifest
+          import android.content.Context
+          import android.content.pm.PackageManager
+          import android.os.Handler
+          import android.os.Looper
+          import android.telephony.TelephonyManager
+          import androidx.core.content.ContextCompat
+
+          /** Sends USSD codes one at a time (Android allows one session), each with a timeout. */
+          object Ussd {
+              private class Job(
+                  val code: String,
+                  val onReply: (String) -> Unit,
+                  val onError: (String) -> Unit
+              )
+
+              private const val TIMEOUT_MS = 25_000L
+              private val main = Handler(Looper.getMainLooper())
+              private val jobs = ArrayDeque<Job>()
+              private var running: Job? = null
+              private var app: Context? = null
+
+              fun send(ctx: Context, code: String, onReply: (String) -> Unit, onError: (String) -> Unit) {
+                  if (Looper.myLooper() != Looper.getMainLooper()) {
+                      main.post { send(ctx, code, onReply, onError) }
+                      return
+                  }
+                  app = ctx.applicationContext
+                  jobs.addLast(Job(code, onReply, onError))
+                  pump()
+              }
+
+              private fun pump() {
+                  if (running != null) return
+                  val ctx = app ?: return
+                  val job = jobs.removeFirstOrNull() ?: return
+                  running = job
+
+                  val allowed = ContextCompat.checkSelfPermission(ctx, Manifest.permission.CALL_PHONE) ==
+                      PackageManager.PERMISSION_GRANTED
+                  if (!allowed) {
+                      complete(job, null, "Phone permission is not granted")
+                      return
+                  }
+                  val tm = ctx.getSystemService(TelephonyManager::class.java)
+                  if (tm == null) {
+                      complete(job, null, "This device cannot send USSD requests")
+                      return
+                  }
+
+                  main.postDelayed({ complete(job, null, "No reply from the network (timed out)") }, TIMEOUT_MS)
+                  try {
+                      tm.sendUssdRequest(job.code, object : TelephonyManager.UssdResponseCallback() {
+                          override fun onReceiveUssdResponse(t: TelephonyManager, request: String, response: CharSequence) {
+                              complete(job, response.toString(), null)
+                          }
+
+                          override fun onReceiveUssdResponseFailed(t: TelephonyManager, request: String, failureCode: Int) {
+                              complete(job, null, "USSD error $failureCode")
+                          }
+                      }, main)
+                  } catch (e: Exception) {
+                      complete(job, null, e.javaClass.simpleName)
+                  }
+              }
+
+              /** Finishes [job] once; a late reply after a timeout is ignored. */
+              private fun complete(job: Job, reply: String?, error: String?) {
+                  if (running !== job) return
+                  running = null
+                  if (reply != null) job.onReply(reply) else job.onError(error ?: "unknown error")
+                  pump()
+              }
+          }
+          EOF_20
+          cat > airtime/app/src/main/java/com/example/airtimeloader/Widgets.kt <<'EOF_21'
+          package com.example.airtimeloader
+
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.Composable
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.text.font.FontFamily
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+
+          /** Scrollable page that leaves room for the status bar. */
+          @Composable
+          fun TabColumn(content: @Composable () -> Unit) {
+              Column(
+                  Modifier
+                      .fillMaxSize()
+                      .statusBarsPadding()
+                      .verticalScroll(rememberScrollState())
+                      .padding(horizontal = 20.dp, vertical = 16.dp),
+                  verticalArrangement = Arrangement.spacedBy(16.dp)
+              ) { content() }
+          }
+
+          @Composable
+          fun Header(title: String, subtitle: String) {
+              val p = LocalPalette.current
+              Column {
+                  Text(title, color = p.textHi, fontSize = 28.sp, fontWeight = FontWeight.Bold)
+                  Text(subtitle, color = p.textLo, fontSize = 14.sp)
+              }
+          }
+
+          @Composable
+          fun Panel(content: @Composable () -> Unit) {
+              val p = LocalPalette.current
+              Surface(shape = RoundedCornerShape(22.dp), color = p.card, modifier = Modifier.fillMaxWidth()) {
+                  Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) { content() }
+              }
+          }
+
+          @Composable
+          fun Title(text: String) {
+              val p = LocalPalette.current
+              Text(text, color = p.textHi, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+          }
+
+          @Composable
+          fun Body(text: String, mono: Boolean = false) {
+              val p = LocalPalette.current
+              Text(
+                  text,
+                  color = p.textLo,
+                  fontSize = if (mono) 12.sp else 13.sp,
+                  fontFamily = if (mono) FontFamily.Monospace else FontFamily.Default
+              )
+          }
+
+          @Composable
+          fun AccentButton(label: String, enabled: Boolean = true, onClick: () -> Unit) {
+              val p = LocalPalette.current
+              Button(
+                  onClick = onClick,
+                  enabled = enabled,
+                  shape = RoundedCornerShape(14.dp),
+                  colors = ButtonDefaults.buttonColors(containerColor = p.accent, contentColor = p.onAccent)
+              ) { Text(label, fontWeight = FontWeight.SemiBold) }
+          }
+
+          @Composable
+          fun GhostButton(label: String, onClick: () -> Unit) {
+              val p = LocalPalette.current
+              OutlinedButton(onClick = onClick, shape = RoundedCornerShape(14.dp)) { Text(label, color = p.accent) }
+          }
+
+          @Composable
+          fun Stat(label: String, value: String, modifier: Modifier = Modifier) {
+              val p = LocalPalette.current
+              Column(modifier, horizontalAlignment = Alignment.CenterHorizontally) {
+                  Text(value, color = p.accent, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                  Text(label, color = p.textLo, fontSize = 12.sp)
+              }
+          }
+          EOF_21
+          cat > airtime/app/src/main/res/drawable/ic_launcher_background.xml <<'EOF_22'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:aapt="http://schemas.android.com/aapt"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path android:pathData="M0,0h108v108h-108z">
+                  <aapt:attr name="android:fillColor">
+                      <gradient
+                          android:startX="0"
+                          android:startY="0"
+                          android:endX="108"
+                          android:endY="108"
+                          android:type="linear">
+                          <item android:color="#FF0F766E" android:offset="0.0" />
+                          <item android:color="#FF0A1018" android:offset="1.0" />
+                      </gradient>
+                  </aapt:attr>
+              </path>
+          </vector>
+          EOF_22
+          cat > airtime/app/src/main/res/drawable/ic_launcher_foreground.xml <<'EOF_23'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:aapt="http://schemas.android.com/aapt"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path
+                  android:fillColor="#FFF1F5F9"
+                  android:pathData="M45,28h18a6,6 0 0 1 6,6v40a6,6 0 0 1 -6,6h-18a6,6 0 0 1 -6,-6v-40a6,6 0 0 1 6,-6z" />
+              <path
+                  android:fillColor="#FF0A1F24"
+                  android:pathData="M45,33h18a3,3 0 0 1 3,3v33a3,3 0 0 1 -3,3h-18a3,3 0 0 1 -3,-3v-33a3,3 0 0 1 3,-3z" />
+              <path
+                  android:fillColor="#FF94A3B8"
+                  android:pathData="M50,75h8v2h-8z" />
+              <path
+                  android:fillColor="#FF7DD3C0"
+                  android:pathData="M53,39h2v3h-2z M57,37h2v5h-2z M61,35h2v7h-2z" />
+              <path
+                  android:fillColor="#FF34D399"
+                  android:pathData="M52,51h4v4.5h4.5v4h-4.5v4.5h-4v-4.5h-4.5v-4h4.5z" />
+          </vector>
+          EOF_23
+          cat > airtime/app/src/main/res/drawable/ic_launcher_monochrome.xml <<'EOF_24'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:aapt="http://schemas.android.com/aapt"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path
+                  android:fillColor="#FF000000"
+                  android:fillType="evenOdd"
+                  android:pathData="M45,28h18a6,6 0 0 1 6,6v40a6,6 0 0 1 -6,6h-18a6,6 0 0 1 -6,-6v-40a6,6 0 0 1 6,-6z M45,33h18a3,3 0 0 1 3,3v33a3,3 0 0 1 -3,3h-18a3,3 0 0 1 -3,-3v-33a3,3 0 0 1 3,-3z M53,39h2v3h-2z M57,37h2v5h-2z M61,35h2v7h-2z M52,51h4v4.5h4.5v4h-4.5v4.5h-4v-4.5h-4.5v-4h4.5z M50,75h8v2h-8z" />
+          </vector>
+          EOF_24
+          cat > airtime/app/src/main/res/drawable/ic_stat_airtime.xml <<'EOF_25'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp"
+              android:height="24dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#FFFFFFFF"
+                  android:fillType="evenOdd"
+                  android:pathData="M9,2h6a2.5,2.5 0 0 1 2.5,2.5v15a2.5,2.5 0 0 1 -2.5,2.5h-6a2.5,2.5 0 0 1 -2.5,-2.5v-15a2.5,2.5 0 0 1 2.5,-2.5z M9,4h6a1,1 0 0 1 1,1v12.5a1,1 0 0 1 -1,1h-6a1,1 0 0 1 -1,-1v-12.5a1,1 0 0 1 1,-1z M11.1,8.2h1.8v2.2h2.2v1.8h-2.2v2.2h-1.8v-2.2h-2.2v-1.8h2.2z" />
+          </vector>
+          EOF_25
+          cat > airtime/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml <<'EOF_26'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@drawable/ic_launcher_background" />
+              <foreground android:drawable="@drawable/ic_launcher_foreground" />
+              <monochrome android:drawable="@drawable/ic_launcher_monochrome" />
+          </adaptive-icon>
+          EOF_26
+          cat > airtime/app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml <<'EOF_27'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@drawable/ic_launcher_background" />
+              <foreground android:drawable="@drawable/ic_launcher_foreground" />
+              <monochrome android:drawable="@drawable/ic_launcher_monochrome" />
+          </adaptive-icon>
+          EOF_27
+          cat > airtime/app/src/main/res/values/strings.xml <<'EOF_28'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="screen_reader_description">Reads the screen only when you double-press Volume Up. It looks for 16-digit airtime PINs and ignores everything else. Screen content is never stored or sent anywhere. The internet permission is used only by the Wi-Fi speed test.</string>
+          </resources>
+          EOF_28
+          cat > airtime/app/src/main/res/xml/accessibility_config.xml <<'EOF_29'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagRequestFilterKeyEvents|flagIncludeNotImportantViews"
+              android:canRequestFilterKeyEvents="true"
+              android:canRetrieveWindowContent="true"
+              android:canTakeScreenshot="true"
+              android:description="@string/screen_reader_description"
+              android:notificationTimeout="100" />
+          EOF_29
+          cat > airtime/build.gradle.kts <<'EOF_30'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_30
+          cat > airtime/gradle.properties <<'EOF_31'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx3072m
+          kotlin.code.style=official
+          EOF_31
+          cat > airtime/settings.gradle.kts <<'EOF_32'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "AirtimeLoader"
+          include(":app")
+          EOF_32
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Accept Android SDK licenses
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Build debug APK
+        working-directory: airtime
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: airtime-loader-apk
+          path: airtime/app/build/outputs/apk/debug/app-debug.apk
